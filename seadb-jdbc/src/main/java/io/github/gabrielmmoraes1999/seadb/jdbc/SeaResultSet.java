@@ -44,6 +44,8 @@ final class SeaResultSet implements ResultSet {
     private boolean closed;
     private int fetchSize;
     private int fetchDirection = FETCH_FORWARD;
+    private long cursorId;
+    private boolean forwardOnly;
 
     private SeaResultSet(SeaStatement statement, List<JdbcColumn> columns, List<Object[]> rows) {
         this.statement = statement;
@@ -69,7 +71,17 @@ final class SeaResultSet implements ResultSet {
             }
             rows.add(values);
         }
-        return new SeaResultSet(statement, columns, rows);
+        SeaResultSet resultSet = new SeaResultSet(statement, columns, rows);
+        resultSet.cursorId = result.cursor();
+        if (statement != null) {
+            try {
+                resultSet.forwardOnly = statement.getResultSetType() == ResultSet.TYPE_FORWARD_ONLY;
+                resultSet.fetchSize = statement.getFetchSize();
+            } catch (SQLException ignored) {
+                resultSet.forwardOnly = true;
+            }
+        }
+        return resultSet;
     }
 
     static SeaResultSet metadata(List<JdbcColumn> columns, List<Object[]> rows) {
@@ -84,8 +96,44 @@ final class SeaResultSet implements ResultSet {
                 cursor++;
                 return true;
             }
-            cursor = rows.size();
-            return false;
+            if (cursorId == 0) {
+                cursor = rows.size();
+                return false;
+            }
+            int kept = forwardOnly ? 0 : rows.size();
+            if (forwardOnly) {
+                rows.clear();
+            }
+            append(fetchBlock());
+            if (rows.size() == kept) {
+                cursor = rows.size();
+                return false;
+            }
+            cursor = kept;
+            return true;
+        }
+    }
+
+    private void drain() throws SQLException {
+        while (cursorId != 0) {
+            append(fetchBlock());
+        }
+    }
+
+    private SqlResult fetchBlock() throws SQLException {
+        int size = fetchSize > 0 ? fetchSize : 64;
+        SqlResult more = statement.connection.fetch(cursorId, size);
+        cursorId = more.cursor();
+        return more;
+    }
+
+    private void append(SqlResult more) {
+        for (Row row : more.rows()) {
+            Object[] values = new Object[row.size()];
+            for (int column = 0; column < row.size(); column++) {
+                values[column] = row.get(column);
+            }
+            rows.add(values);
         }
     }
 
@@ -399,12 +447,14 @@ final class SeaResultSet implements ResultSet {
     @Override
     public void beforeFirst() throws SQLException {
         checkOpen();
+        drain();
         cursor = -1;
     }
 
     @Override
     public void afterLast() throws SQLException {
         checkOpen();
+        drain();
         cursor = rows.size();
     }
 
@@ -427,6 +477,7 @@ final class SeaResultSet implements ResultSet {
     @Override
     public boolean absolute(int row) throws SQLException {
         checkOpen();
+        drain();
         if (row == 0) {
             cursor = -1;
             return false;
@@ -451,6 +502,9 @@ final class SeaResultSet implements ResultSet {
     @Override
     public boolean relative(int rowsDelta) throws SQLException {
         checkOpen();
+        if (rowsDelta < 0 || cursorId != 0) {
+            drain();
+        }
         if (rowsDelta == 0) {
             return onRow();
         }

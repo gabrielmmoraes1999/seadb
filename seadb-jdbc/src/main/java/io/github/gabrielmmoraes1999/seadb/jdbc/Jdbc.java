@@ -17,10 +17,32 @@ final class Jdbc {
     }
 
     static SQLException wrap(RuntimeException exception) {
-        if (exception instanceof SeaException) {
-            return new SQLException(exception.getMessage(), "42000", exception);
+        if (exception instanceof SeaException sea) {
+            return new SQLException(exception.getMessage(), sea.sqlState(), exception);
         }
         return new SQLException(exception.getMessage(), "HY000", exception);
+    }
+
+    /** {@code EXECUTE PROCEDURE} or the JDBC escape {@code {call name(...)}}. */
+    static String procedureCall(String sql) throws SQLException {
+        if (sql == null || sql.isBlank()) {
+            throw new SQLException("SQL is required");
+        }
+        String trimmed = sql.trim();
+        if (trimmed.regionMatches(true, 0, "EXECUTE", 0, 7)) {
+            return trimmed;
+        }
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            String body = trimmed.substring(1, trimmed.length() - 1).trim();
+            if (body.regionMatches(true, 0, "call", 0, 4)
+                    && (body.length() == 4 || Character.isWhitespace(body.charAt(4)))) {
+                String rest = body.substring(4).trim();
+                if (!rest.isEmpty()) {
+                    return "EXECUTE PROCEDURE " + rest;
+                }
+            }
+        }
+        throw new SQLException("procedure call is not supported");
     }
 
     static SQLFeatureNotSupportedException unsupported(String feature) {
@@ -110,6 +132,8 @@ final class Jdbc {
             case TIMESTAMP -> Types.TIMESTAMP;
             case DECIMAL -> Types.DECIMAL;
             case BLOB -> Types.BLOB;
+            case UUID, JSON, INTERVAL -> Types.OTHER;
+            case TIMESTAMPTZ -> Types.TIMESTAMP_WITH_TIMEZONE;
         };
     }
 
@@ -127,6 +151,10 @@ final class Jdbc {
             case TIMESTAMP -> "java.time.LocalDateTime";
             case DECIMAL -> "java.math.BigDecimal";
             case BLOB -> "[B";
+            case UUID -> "java.util.UUID";
+            case JSON -> "java.lang.String";
+            case INTERVAL -> "io.github.gabrielmmoraes1999.seadb.SqlInterval";
+            case TIMESTAMPTZ -> "java.time.OffsetDateTime";
         };
     }
 
@@ -144,6 +172,10 @@ final class Jdbc {
             case TIME -> 18;
             case TIMESTAMP -> 26;
             case DECIMAL -> length > 0 ? length : 38;
+            case UUID -> 36;
+            case JSON -> 8192;
+            case INTERVAL -> 24;
+            case TIMESTAMPTZ -> 32;
         };
     }
 
@@ -161,6 +193,10 @@ final class Jdbc {
             case TIMESTAMP -> 26;
             case DECIMAL -> length > 0 ? length + 2 : 20;
             case BLOB -> 32;
+            case UUID -> 36;
+            case JSON -> 8192;
+            case INTERVAL -> 24;
+            case TIMESTAMPTZ -> 32;
         };
     }
 

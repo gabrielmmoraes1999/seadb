@@ -2,6 +2,9 @@ package io.github.gabrielmmoraes1999.seadb;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -21,35 +24,60 @@ final class Evaluator {
         Object read(String name, Integer precision);
     }
 
+    interface Subqueries {
+        Object scalar(Query query, Evaluator outer);
+
+        Object in(Expr expr, Query query, boolean negated, Evaluator outer);
+
+        Object exists(Query query, Evaluator outer);
+    }
+
+    @FunctionalInterface
+    interface Functions {
+        Object call(String name, List<Object> args);
+    }
+
     private final TableStore table;
     private final Object[] params;
     private final String alias;
     private final RoutineScope scope;
     private final Sequences sequences;
     private final Contexts contexts;
+    private final Subqueries subqueries;
+    private Functions functions;
+    Evaluator link;
     private StoredRow current;
     private Schema viewSchema;
     private String viewQualifier;
     private Object[] viewRow;
+    private Schema excludedSchema;
+    private Object[] excludedRow;
     private List<Frame> frames;
     private Object[] joinedRow;
 
     Evaluator(TableStore table, Object[] params, String alias) {
-        this(table, params, alias, null, null, null);
+        this(table, params, alias, null, null, null, null);
     }
 
-    Evaluator(TableStore table, Object[] params, String alias, RoutineScope scope, Sequences sequences, Contexts contexts) {
+    Evaluator(TableStore table, Object[] params, String alias, RoutineScope scope, Sequences sequences, Contexts contexts,
+              Subqueries subqueries) {
         this.table = table;
         this.params = params;
         this.alias = alias;
         this.scope = scope;
         this.sequences = sequences;
         this.contexts = contexts;
+        this.subqueries = subqueries;
     }
 
     void bind(StoredRow row) {
         this.current = row;
         this.joinedRow = null;
+    }
+
+    void bindExcluded(Schema schema, Object[] values) {
+        this.excludedSchema = schema;
+        this.excludedRow = values;
     }
 
     void useView(Schema schema, String qualifier) {
@@ -151,6 +179,12 @@ final class Evaluator {
             case InList inList -> inList(inList);
             case Between between -> between(between);
             case Call call -> call(call);
+            case WindowExpr ignored -> null;
+            case CaseExpr caseExpr -> caseExpr(caseExpr);
+            case CastExpr cast -> cast(cast);
+            case ScalarSubquery subquery -> subquery(subquery);
+            case InSubquery inSubquery -> inSubquery(inSubquery);
+            case ExistsExpr exists -> exists(exists);
         };
     }
 
@@ -183,6 +217,11 @@ final class Evaluator {
                     || (like.escape() != null && containsColumn(like.escape()));
             case InList inList -> containsColumn(inList.expr()) || inList.values().stream().anyMatch(Evaluator::containsColumn);
             case Between between -> containsColumn(between.expr()) || containsColumn(between.low()) || containsColumn(between.high());
+            case CaseExpr caseExpr -> containsCase(caseExpr, Evaluator::containsColumn);
+            case CastExpr cast -> containsColumn(cast.expr());
+            case InSubquery inSubquery -> containsColumn(inSubquery.expr());
+            case ScalarSubquery ignored -> false;
+            case ExistsExpr ignored -> false;
             default -> false;
         };
     }
@@ -207,6 +246,11 @@ final class Evaluator {
             case InList inList -> new InList(foldBound(inList.expr(), size, bindRow), foldAllBound(inList.values(), size, bindRow), inList.negated());
             case Between between -> new Between(foldBound(between.expr(), size, bindRow), foldBound(between.low(), size, bindRow),
                     foldBound(between.high(), size, bindRow), between.negated());
+            case CaseExpr caseExpr -> foldCase(caseExpr, size, bindRow);
+            case CastExpr cast -> new CastExpr(foldBound(cast.expr(), size, bindRow), cast.type(), cast.length(), cast.scale());
+            case InSubquery inSubquery -> new InSubquery(foldBound(inSubquery.expr(), size, bindRow), inSubquery.query(), inSubquery.negated());
+            case ScalarSubquery ignored -> expr;
+            case ExistsExpr ignored -> expr;
             default -> expr;
         };
     }
@@ -230,6 +274,11 @@ final class Evaluator {
                     || (like.escape() != null && containsAggregate(like.escape()));
             case InList inList -> containsAggregate(inList.expr()) || inList.values().stream().anyMatch(Evaluator::containsAggregate);
             case Between between -> containsAggregate(between.expr()) || containsAggregate(between.low()) || containsAggregate(between.high());
+            case CaseExpr caseExpr -> containsCase(caseExpr, Evaluator::containsAggregate);
+            case CastExpr cast -> containsAggregate(cast.expr());
+            case InSubquery inSubquery -> containsAggregate(inSubquery.expr());
+            case ScalarSubquery ignored -> false;
+            case ExistsExpr ignored -> false;
             default -> false;
         };
     }
@@ -348,6 +397,17 @@ final class Evaluator {
     }
 
     private Object column(ColumnRef column) {
+        if (column.qualifier() != null && Names.same(column.qualifier(), "EXCLUDED")) {
+            if (excludedSchema == null || excludedRow == null) {
+                throw new SeaException("EXCLUDED cannot be used in this statement");
+            }
+            int index = excludedSchema.indexOf(column.name());
+            if (index < 0) {
+                throw new SeaException("column not found: " + column.name());
+            }
+            Object value = excludedRow[index];
+            return value == Values.MISSING ? null : value;
+        }
         if (column.qualifier() != null && (Names.same(column.qualifier(), "NEW") || Names.same(column.qualifier(), "OLD"))) {
             if (scope == null) {
                 throw new SeaException(column.qualifier() + " does not exist in this context");
@@ -468,6 +528,33 @@ final class Evaluator {
         throw new SeaException("cannot negate " + Values.display(value));
     }
 
+    private int collationOf(Expr expr) {
+        if (!(expr instanceof ColumnRef column)) {
+            return Collation.BINARY;
+        }
+        if (table != null && (column.qualifier() == null || Names.same(column.qualifier(), table.schema().name)
+                || (alias != null && Names.same(column.qualifier(), alias)))) {
+            int index = table.schema().indexOf(column.name());
+            if (index >= 0) {
+                return table.schema().columns.get(index).collation;
+            }
+        }
+        if (viewSchema != null) {
+            int index = viewSchema.indexOf(column.name());
+            if (index >= 0) {
+                return viewSchema.columns.get(index).collation;
+            }
+        }
+        if (frames != null) {
+            Frame frame = Frame.find(frames, column.qualifier(), column.name());
+            int index = frame.schema.indexOf(column.name());
+            if (index >= 0) {
+                return frame.schema.columns.get(index).collation;
+            }
+        }
+        return Collation.BINARY;
+    }
+
     private Object binary(Binary binary) {
         if (binary.op() == BinaryOp.AND) {
             return logicAnd(binary.left(), binary.right());
@@ -486,13 +573,14 @@ final class Evaluator {
         if (left == null || right == null) {
             return null;
         }
+        int collation = Math.max(collationOf(binary.left()), collationOf(binary.right()));
         return switch (binary.op()) {
-            case EQ -> Values.compare(left, right) == 0;
-            case NE -> Values.compare(left, right) != 0;
-            case LT -> Values.compare(left, right) < 0;
-            case GT -> Values.compare(left, right) > 0;
-            case LE -> Values.compare(left, right) <= 0;
-            case GE -> Values.compare(left, right) >= 0;
+            case EQ -> Collation.compare(left, right, collation) == 0;
+            case NE -> Collation.compare(left, right, collation) != 0;
+            case LT -> Collation.compare(left, right, collation) < 0;
+            case GT -> Collation.compare(left, right, collation) > 0;
+            case LE -> Collation.compare(left, right, collation) <= 0;
+            case GE -> Collation.compare(left, right, collation) >= 0;
             case ADD -> add(left, right);
             case SUB -> subtract(left, right);
             case MUL -> multiply(left, right);
@@ -625,8 +713,466 @@ final class Evaluator {
             case "LOWER", "UPPER" -> changeCase(call, name.equals("UPPER"));
             case "LENGTH", "CHAR_LENGTH" -> length(call);
             case "COALESCE" -> coalesce(call);
-            default -> throw new SeaException("unknown function: " + call.name());
+            case "SUBSTRING" -> substring(call);
+            case "TRIM" -> trim(call, 0);
+            case "LTRIM" -> trim(call, -1);
+            case "RTRIM" -> trim(call, 1);
+            case "REPLACE" -> replace(call);
+            case "POSITION" -> position(call);
+            case "ABS" -> abs(call);
+            case "ROUND" -> round(call);
+            case "CEIL", "CEILING" -> ceil(call, true);
+            case "FLOOR" -> ceil(call, false);
+            case "SIGN" -> sign(call);
+            case "MOD" -> mod(call);
+            case "EXTRACT" -> extract(call);
+            case "DATEADD" -> dateAdd(call);
+            case "DATEDIFF" -> dateDiff(call);
+            case "JSON_EXTRACT" -> jsonExtract(call);
+            case "JSON_TYPE" -> jsonType(call);
+            default -> delegate(call);
         };
+    }
+
+    /**
+     * Value of {@code column} when this binding owns it, or {@link Values#MISSING} when it belongs elsewhere.
+     */
+    Object readOwned(ColumnRef column) {
+        if (frames != null) {
+            if (joinedRow == null) {
+                return Values.MISSING;
+            }
+            boolean found = false;
+            for (Frame frame : frames) {
+                if (column.qualifier() != null && !frame.matches(column.qualifier())) {
+                    continue;
+                }
+                if (frame.schema.indexOf(column.name()) < 0) {
+                    continue;
+                }
+                if (found) {
+                    throw new SeaException("ambiguous column: " + column.name());
+                }
+                found = true;
+            }
+            if (!found) {
+                return Values.MISSING;
+            }
+            return joinedColumn(column);
+        }
+        if (viewSchema != null) {
+            boolean named = column.qualifier() == null
+                    || Names.same(column.qualifier(), viewSchema.name)
+                    || Names.same(column.qualifier(), viewQualifier)
+                    || (alias != null && Names.same(column.qualifier(), alias));
+            if (!named || viewRow == null || viewSchema.indexOf(column.name()) < 0) {
+                return Values.MISSING;
+            }
+            Object value = viewRow[viewSchema.indexOf(column.name())];
+            return value == Values.MISSING ? null : value;
+        }
+        if (table == null || current == null) {
+            return Values.MISSING;
+        }
+        if (column.qualifier() != null
+                && !Names.same(column.qualifier(), table.schema().name)
+                && !Names.same(column.qualifier(), table.namespace() + "." + table.schema().name)
+                && (alias == null || !Names.same(column.qualifier(), alias))) {
+            return Values.MISSING;
+        }
+        int index = table.schema().indexOf(column.name());
+        if (index < 0) {
+            return Values.MISSING;
+        }
+        return table.value(current, index);
+    }
+
+    private Object subquery(ScalarSubquery subquery) {
+        if (subqueries == null) {
+            throw new SeaException("subquery cannot be used in this statement");
+        }
+        return subqueries.scalar(subquery.query(), this);
+    }
+
+    private Object inSubquery(InSubquery subquery) {
+        if (subqueries == null) {
+            throw new SeaException("subquery cannot be used in this statement");
+        }
+        return subqueries.in(subquery.expr(), subquery.query(), subquery.negated(), this);
+    }
+
+    private Object exists(ExistsExpr exists) {
+        if (subqueries == null) {
+            throw new SeaException("subquery cannot be used in this statement");
+        }
+        return subqueries.exists(exists.query(), this);
+    }
+
+    private Object caseExpr(CaseExpr expr) {
+        if (expr.operand() != null) {
+            Object basis = eval(expr.operand());
+            for (WhenBranch branch : expr.branches()) {
+                Object when = eval(branch.when());
+                if (basis != null && when != null && Values.compare(basis, when) == 0) {
+                    return eval(branch.then());
+                }
+            }
+        } else {
+            for (WhenBranch branch : expr.branches()) {
+                if (truth(branch.when())) {
+                    return eval(branch.then());
+                }
+            }
+        }
+        return expr.otherwise() == null ? null : eval(expr.otherwise());
+    }
+
+    private Object cast(CastExpr cast) {
+        Object value = eval(cast.expr());
+        if (value == null) {
+            return null;
+        }
+        return Values.coerce(cast.type(), cast.length(), cast.scale(), value);
+    }
+
+    private static boolean containsCase(CaseExpr expr, java.util.function.Predicate<Expr> test) {
+        if (expr.operand() != null && test.test(expr.operand())) {
+            return true;
+        }
+        for (WhenBranch branch : expr.branches()) {
+            if (test.test(branch.when()) || test.test(branch.then())) {
+                return true;
+            }
+        }
+        return expr.otherwise() != null && test.test(expr.otherwise());
+    }
+
+    private CaseExpr foldCase(CaseExpr expr, int size, IntConsumer bindRow) {
+        List<WhenBranch> branches = new ArrayList<>();
+        for (WhenBranch branch : expr.branches()) {
+            branches.add(new WhenBranch(foldBound(branch.when(), size, bindRow), foldBound(branch.then(), size, bindRow)));
+        }
+        return new CaseExpr(
+                expr.operand() == null ? null : foldBound(expr.operand(), size, bindRow),
+                branches,
+                expr.otherwise() == null ? null : foldBound(expr.otherwise(), size, bindRow));
+    }
+
+    private Object substring(Call call) {
+        if (call.args().size() < 2 || call.args().size() > 3) {
+            throw new SeaException("SUBSTRING expects the text, the start, and the length");
+        }
+        Object value = eval(call.args().get(0));
+        Object startValue = eval(call.args().get(1));
+        Object lengthValue = call.args().size() == 3 ? eval(call.args().get(2)) : null;
+        if (value == null || startValue == null || (call.args().size() == 3 && lengthValue == null)) {
+            return null;
+        }
+        if (!(value instanceof String text)) {
+            throw new SeaException("SUBSTRING expects a string");
+        }
+        int start = Values.toInt(startValue);
+        if (start < 1) {
+            throw new SeaException("SUBSTRING position starts at 1");
+        }
+        int from = start - 1;
+        if (from >= text.length()) {
+            return "";
+        }
+        if (call.args().size() == 2) {
+            return text.substring(from);
+        }
+        int length = Values.toInt(lengthValue);
+        if (length < 0) {
+            throw new SeaException("SUBSTRING length cannot be negative");
+        }
+        int to = Math.min(text.length(), from + length);
+        return text.substring(from, to);
+    }
+
+    /** {@code side} is -1 for left, 1 for right, and 0 for both. */
+    private Object trim(Call call, int side) {
+        Object value = oneArg(call);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String text)) {
+            throw new SeaException(call.name() + " expects a string");
+        }
+        if (side < 0) {
+            return text.stripLeading();
+        }
+        if (side > 0) {
+            return text.stripTrailing();
+        }
+        return text.strip();
+    }
+
+    private Object replace(Call call) {
+        if (call.args().size() != 3) {
+            throw new SeaException("REPLACE expects three arguments");
+        }
+        Object value = eval(call.args().get(0));
+        Object from = eval(call.args().get(1));
+        Object to = eval(call.args().get(2));
+        if (value == null || from == null || to == null) {
+            return null;
+        }
+        if (!(value instanceof String text) || !(from instanceof String needle) || !(to instanceof String replacement)) {
+            throw new SeaException("REPLACE expects strings");
+        }
+        if (needle.isEmpty()) {
+            return text;
+        }
+        return text.replace(needle, replacement);
+    }
+
+    private Object position(Call call) {
+        if (call.args().size() != 2) {
+            throw new SeaException("POSITION expects two arguments");
+        }
+        Object needleValue = eval(call.args().get(0));
+        Object haystackValue = eval(call.args().get(1));
+        if (needleValue == null || haystackValue == null) {
+            return null;
+        }
+        if (!(needleValue instanceof String needle) || !(haystackValue instanceof String haystack)) {
+            throw new SeaException("POSITION expects strings");
+        }
+        int at = haystack.indexOf(needle);
+        return at < 0 ? 0L : (long) at + 1;
+    }
+
+    private Object abs(Call call) {
+        Object value = oneArg(call);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal.abs();
+        }
+        if (value instanceof Double number) {
+            return Math.abs(number);
+        }
+        if (value instanceof Float number) {
+            return Math.abs(number);
+        }
+        if (value instanceof Long number) {
+            return Math.absExact(number);
+        }
+        if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
+            return Math.abs(((Number) value).intValue());
+        }
+        throw new SeaException("ABS expects a number");
+    }
+
+    private Object round(Call call) {
+        if (call.args().size() != 1 && call.args().size() != 2) {
+            throw new SeaException("ROUND expects one or two arguments");
+        }
+        Object value = eval(call.args().get(0));
+        if (value == null) {
+            return null;
+        }
+        int scale = 0;
+        if (call.args().size() == 2) {
+            Object scaleValue = eval(call.args().get(1));
+            if (scaleValue == null) {
+                return null;
+            }
+            scale = Values.toInt(scaleValue);
+        }
+        if (!(value instanceof Number)) {
+            throw new SeaException("ROUND expects a number");
+        }
+        BigDecimal rounded = Values.asDecimal(value).setScale(scale, RoundingMode.HALF_UP);
+        if (value instanceof Double || value instanceof Float) {
+            return rounded.doubleValue();
+        }
+        if (value instanceof BigDecimal) {
+            return rounded;
+        }
+        if (scale > 0) {
+            return rounded;
+        }
+        long whole = rounded.longValueExact();
+        if (value instanceof Long) {
+            return whole;
+        }
+        return Math.toIntExact(whole);
+    }
+
+    private Object ceil(Call call, boolean up) {
+        Object value = oneArg(call);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Long || value instanceof Integer || value instanceof Short || value instanceof Byte) {
+            return value;
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal.setScale(0, up ? RoundingMode.CEILING : RoundingMode.FLOOR);
+        }
+        if (value instanceof Double || value instanceof Float) {
+            double number = Values.toDouble(value);
+            return up ? Math.ceil(number) : Math.floor(number);
+        }
+        throw new SeaException(call.name() + " expects a number");
+    }
+
+    private Object sign(Call call) {
+        Object value = oneArg(call);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Number)) {
+            throw new SeaException("SIGN expects a number");
+        }
+        int cmp = Values.asDecimal(value).signum();
+        return cmp;
+    }
+
+    private Object mod(Call call) {
+        if (call.args().size() != 2) {
+            throw new SeaException("MOD expects two arguments");
+        }
+        Object left = eval(call.args().get(0));
+        Object right = eval(call.args().get(1));
+        if (left == null || right == null) {
+            return null;
+        }
+        return modulo(left, right);
+    }
+
+    private Object extract(Call call) {
+        if (call.args().size() != 2) {
+            throw new SeaException("EXTRACT expects a part and a value");
+        }
+        Object partValue = eval(call.args().get(0));
+        Object value = eval(call.args().get(1));
+        if (partValue == null || value == null) {
+            return null;
+        }
+        String part = datePart(partValue);
+        return switch (part) {
+            case "YEAR" -> dateTime(value, part).getYear();
+            case "MONTH" -> dateTime(value, part).getMonthValue();
+            case "DAY" -> dateTime(value, part).getDayOfMonth();
+            case "HOUR" -> clock(value, part).getHour();
+            case "MINUTE" -> clock(value, part).getMinute();
+            case "SECOND" -> clock(value, part).getSecond();
+            default -> throw new SeaException("unknown date part: " + part);
+        };
+    }
+
+    private Object dateAdd(Call call) {
+        if (call.args().size() != 3) {
+            throw new SeaException("DATEADD expects a part, an amount, and a value");
+        }
+        Object partValue = eval(call.args().get(0));
+        Object amountValue = eval(call.args().get(1));
+        Object value = eval(call.args().get(2));
+        if (partValue == null || amountValue == null || value == null) {
+            return null;
+        }
+        String part = datePart(partValue);
+        long amount = Values.toLong(amountValue);
+        if (value instanceof LocalDate date) {
+            return switch (part) {
+                case "YEAR" -> date.plusYears(amount);
+                case "MONTH" -> date.plusMonths(amount);
+                case "DAY" -> date.plusDays(amount);
+                case "HOUR" -> date.atStartOfDay().plusHours(amount);
+                case "MINUTE" -> date.atStartOfDay().plusMinutes(amount);
+                case "SECOND" -> date.atStartOfDay().plusSeconds(amount);
+                default -> throw new SeaException("unknown date part: " + part);
+            };
+        }
+        if (value instanceof LocalDateTime timestamp) {
+            return switch (part) {
+                case "YEAR" -> timestamp.plusYears(amount);
+                case "MONTH" -> timestamp.plusMonths(amount);
+                case "DAY" -> timestamp.plusDays(amount);
+                case "HOUR" -> timestamp.plusHours(amount);
+                case "MINUTE" -> timestamp.plusMinutes(amount);
+                case "SECOND" -> timestamp.plusSeconds(amount);
+                default -> throw new SeaException("unknown date part: " + part);
+            };
+        }
+        if (value instanceof LocalTime time) {
+            return switch (part) {
+                case "HOUR" -> time.plusHours(amount);
+                case "MINUTE" -> time.plusMinutes(amount);
+                case "SECOND" -> time.plusSeconds(amount);
+                default -> throw new SeaException("DATEADD " + part + " expects a date or timestamp");
+            };
+        }
+        throw new SeaException("DATEADD expects a date, time, or timestamp");
+    }
+
+    private Object dateDiff(Call call) {
+        if (call.args().size() != 3) {
+            throw new SeaException("DATEDIFF expects a part and two values");
+        }
+        Object partValue = eval(call.args().get(0));
+        Object start = eval(call.args().get(1));
+        Object end = eval(call.args().get(2));
+        if (partValue == null || start == null || end == null) {
+            return null;
+        }
+        String part = datePart(partValue);
+        if (start instanceof LocalTime || end instanceof LocalTime) {
+            if (!(start instanceof LocalTime from) || !(end instanceof LocalTime to)) {
+                throw new SeaException("DATEDIFF values do not match");
+            }
+            return switch (part) {
+                case "HOUR" -> java.time.temporal.ChronoUnit.HOURS.between(from, to);
+                case "MINUTE" -> java.time.temporal.ChronoUnit.MINUTES.between(from, to);
+                case "SECOND" -> java.time.temporal.ChronoUnit.SECONDS.between(from, to);
+                default -> throw new SeaException("DATEDIFF " + part + " expects a date or timestamp");
+            };
+        }
+        LocalDateTime from = dateTime(start, part);
+        LocalDateTime to = dateTime(end, part);
+        return switch (part) {
+            case "YEAR" -> java.time.temporal.ChronoUnit.YEARS.between(from.toLocalDate(), to.toLocalDate());
+            case "MONTH" -> java.time.temporal.ChronoUnit.MONTHS.between(from.toLocalDate(), to.toLocalDate());
+            case "DAY" -> java.time.temporal.ChronoUnit.DAYS.between(from.toLocalDate(), to.toLocalDate());
+            case "HOUR" -> java.time.temporal.ChronoUnit.HOURS.between(from, to);
+            case "MINUTE" -> java.time.temporal.ChronoUnit.MINUTES.between(from, to);
+            case "SECOND" -> java.time.temporal.ChronoUnit.SECONDS.between(from, to);
+            default -> throw new SeaException("unknown date part: " + part);
+        };
+    }
+
+    private static String datePart(Object value) {
+        if (value instanceof String text) {
+            return text.toUpperCase(Locale.ROOT);
+        }
+        throw new SeaException("unknown date part");
+    }
+
+    private static LocalDateTime dateTime(Object value, String part) {
+        if (value instanceof LocalDateTime timestamp) {
+            return timestamp;
+        }
+        if (value instanceof LocalDate date) {
+            return date.atStartOfDay();
+        }
+        throw new SeaException("EXTRACT " + part + " expects a date or timestamp");
+    }
+
+    private static LocalTime clock(Object value, String part) {
+        if (value instanceof LocalTime time) {
+            return time;
+        }
+        if (value instanceof LocalDateTime timestamp) {
+            return timestamp.toLocalTime();
+        }
+        if (value instanceof LocalDate) {
+            return LocalTime.MIDNIGHT;
+        }
+        throw new SeaException("EXTRACT " + part + " expects a date, time, or timestamp");
     }
 
     private Object changeCase(Call call, boolean upper) {
@@ -674,7 +1220,65 @@ final class Evaluator {
         return eval(call.args().get(0));
     }
 
+    void bindFunctions(Functions functions) {
+        this.functions = functions;
+    }
+
+    private Object delegate(Call call) {
+        if (functions == null) {
+            throw new SeaException("unknown function: " + call.name());
+        }
+        List<Object> values = new ArrayList<>();
+        for (Expr arg : call.args()) {
+            values.add(eval(arg));
+        }
+        return functions.call(call.name(), values);
+    }
+
+    private Object jsonExtract(Call call) {
+        if (call.args().size() != 2) {
+            throw new SeaException("JSON_EXTRACT expects a document and a path");
+        }
+        Object document = eval(call.args().get(0));
+        Object path = eval(call.args().get(1));
+        if (document == null || path == null) {
+            return null;
+        }
+        return JsonDoc.extract(String.valueOf(document), String.valueOf(path));
+    }
+
+    private Object jsonType(Call call) {
+        if (call.args().size() != 1) {
+            throw new SeaException("JSON_TYPE expects one argument");
+        }
+        Object document = eval(call.args().get(0));
+        if (document == null) {
+            return null;
+        }
+        return JsonDoc.typeName(String.valueOf(document));
+    }
+
+    private Object shift(Object base, SqlInterval interval, int sign) {
+        long millis = interval.millis * sign;
+        if (base instanceof LocalDate date) {
+            return date.atStartOfDay().plus(millis, java.time.temporal.ChronoUnit.MILLIS);
+        }
+        if (base instanceof LocalDateTime time) {
+            return time.plus(millis, java.time.temporal.ChronoUnit.MILLIS);
+        }
+        if (base instanceof java.time.OffsetDateTime time) {
+            return time.plus(millis, java.time.temporal.ChronoUnit.MILLIS);
+        }
+        throw new SeaException("INTERVAL requires DATE, TIMESTAMP, or TIMESTAMPTZ");
+    }
+
     private Object add(Object left, Object right) {
+        if (left instanceof SqlInterval interval) {
+            return shift(right, interval, 1);
+        }
+        if (right instanceof SqlInterval interval) {
+            return shift(left, interval, 1);
+        }
         if (floating(left, right)) {
             return Values.toDouble(left) + Values.toDouble(right);
         }
@@ -685,6 +1289,9 @@ final class Evaluator {
     }
 
     private Object subtract(Object left, Object right) {
+        if (right instanceof SqlInterval interval) {
+            return shift(left, interval, -1);
+        }
         if (floating(left, right)) {
             return Values.toDouble(left) - Values.toDouble(right);
         }

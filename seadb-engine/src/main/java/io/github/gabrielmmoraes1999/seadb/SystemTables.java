@@ -17,6 +17,9 @@ final class SystemTables {
     static final String CONFIG = "SEA$CONFIG";
     static final String USERS = "SEA$USERS";
     static final String PRIVILEGES = "SEA$PRIVILEGES";
+    static final String FUNCTIONS = "SEA$FUNCTIONS";
+    static final String FUNCTION_PARAMETERS = "SEA$FUNCTION_PARAMETERS";
+    static final String DOMAINS = "SEA$DOMAINS";
     static final String CONNECTIONS = "SEA$CONNECTIONS";
     static final String GENERATORS = "SEA$GENERATORS";
     static final String PROCEDURES = "SEA$PROCEDURES";
@@ -26,6 +29,9 @@ final class SystemTables {
     static final String ROLES = "SEA$ROLES";
     static final String ROLE_MEMBERS = "SEA$ROLE_MEMBERS";
     static final String SCHEMAS = "SEA$SCHEMAS";
+    static final String STATISTICS = "SEA$STATISTICS";
+    static final String COLUMN_PRIVILEGES = "SEA$COLUMN_PRIVILEGES";
+    static final String REMARKS = "SEA$REMARKS";
     static final String OWNER = "OWNER";
     static final String PUBLIC = "PUBLIC";
     static final List<String> DML = List.of("SELECT", "INSERT", "UPDATE", "DELETE");
@@ -50,7 +56,9 @@ final class SystemTables {
                 || Names.same(name, GENERATORS) || Names.same(name, PROCEDURES)
                 || Names.same(name, PROCEDURE_PARAMETERS) || Names.same(name, TRIGGERS)
                 || Names.same(name, VIEWS) || Names.same(name, ROLES) || Names.same(name, ROLE_MEMBERS)
-                || Names.same(name, SCHEMAS);
+                || Names.same(name, SCHEMAS) || Names.same(name, FUNCTIONS) || Names.same(name, FUNCTION_PARAMETERS)
+                || Names.same(name, DOMAINS) || Names.same(name, STATISTICS)
+                || Names.same(name, COLUMN_PRIVILEGES) || Names.same(name, REMARKS);
     }
 
     static List<Schema> schemas() {
@@ -191,6 +199,76 @@ final class SystemTables {
                 column("SEA$ADMIN_OPTION", DataType.BOOLEAN, 0, true, true, Boolean.FALSE),
                 text("SEA$GRANTOR", 63, true)
         ), new int[]{0, 1}, List.of(), List.of());
+    }
+
+    static Schema functions() {
+        return new Schema(FUNCTIONS, List.of(
+                text("SEA$SCHEMA_NAME", 128, true),
+                text("SEA$FUNCTION_NAME", 63, true),
+                text("SEA$FUNCTION_SOURCE", Format.MAX_CHAR, true),
+                text("SEA$RETURN_TYPE", 32, true),
+                column("SEA$RETURN_LENGTH", DataType.INTEGER, 0, true, false, null),
+                column("SEA$RETURN_SCALE", DataType.INTEGER, 0, true, false, null),
+                text("SEA$OWNER_NAME", 63, true)
+        ), new int[]{0, 1}, List.of(), List.of());
+    }
+
+    static Schema functionParameters() {
+        return new Schema(FUNCTION_PARAMETERS, List.of(
+                text("SEA$SCHEMA_NAME", 128, true),
+                text("SEA$FUNCTION_NAME", 63, true),
+                text("SEA$PARAMETER_NAME", 63, true),
+                column("SEA$PARAMETER_NUMBER", DataType.INTEGER, 0, true, false, null),
+                text("SEA$FIELD_TYPE", 32, true),
+                column("SEA$FIELD_LENGTH", DataType.INTEGER, 0, true, false, null),
+                column("SEA$FIELD_SCALE", DataType.INTEGER, 0, true, false, null)
+        ), new int[]{0, 1, 3}, List.of(), List.of());
+    }
+
+    static Schema domains() {
+        return new Schema(DOMAINS, List.of(
+                text("SEA$SCHEMA_NAME", 128, true),
+                text("SEA$DOMAIN_NAME", 63, true),
+                text("SEA$FIELD_TYPE", 32, true),
+                column("SEA$FIELD_LENGTH", DataType.INTEGER, 0, true, false, null),
+                column("SEA$FIELD_SCALE", DataType.INTEGER, 0, true, false, null),
+                text("SEA$DEFAULT_SOURCE", Format.MAX_CHAR, false),
+                text("SEA$CHECK_SOURCE", Format.MAX_CHAR, false),
+                text("SEA$OWNER_NAME", 63, true)
+        ), new int[]{0, 1}, List.of(), List.of());
+    }
+
+    static Schema remarks() {
+        return new Schema(REMARKS, List.of(
+                text("SEA$KIND", 16, true),
+                text("SEA$SCHEMA_NAME", 128, true),
+                text("SEA$OBJECT_NAME", 128, true),
+                text("SEA$COLUMN_NAME", 63, true),
+                text("SEA$REMARK", Format.MAX_CHAR, true)
+        ), new int[]{0, 1, 2, 3}, List.of(), List.of());
+    }
+
+    static Schema columnPrivileges() {
+        return new Schema(COLUMN_PRIVILEGES, List.of(
+                text("SEA$USER_NAME", 63, true),
+                text("SEA$TABLE_NAME", 128, true),
+                text("SEA$PRIVILEGE", 16, true),
+                text("SEA$COLUMN_NAME", 63, true),
+                column("SEA$GRANT_OPTION", DataType.BOOLEAN, 0, true, true, Boolean.FALSE),
+                text("SEA$GRANTOR", 63, true)
+        ), new int[]{0, 1, 2, 3}, List.of(), List.of());
+    }
+
+    static Schema statistics() {
+        return new Schema(STATISTICS, List.of(
+                text("SEA$SCHEMA_NAME", 128, true),
+                text("SEA$RELATION_NAME", 128, true),
+                text("SEA$INDEX_NAME", 128, true),
+                column("SEA$CARDINALITY", DataType.BIGINT, 0, true, false, null),
+                column("SEA$INDEX_ENTRIES", DataType.BIGINT, 0, true, false, null),
+                text("SEA$LEADING_MIN", 256, false),
+                text("SEA$LEADING_MAX", 256, false)
+        ), new int[]{0, 1, 2}, List.of(), List.of());
     }
 
     private static Column text(String name, int length, boolean notNull) {

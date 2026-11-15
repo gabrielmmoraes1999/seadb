@@ -3,6 +3,7 @@ package io.github.gabrielmmoraes1999.seadb.net;
 import io.github.gabrielmmoraes1999.seadb.BackupPiece;
 import io.github.gabrielmmoraes1999.seadb.ColumnMeta;
 import io.github.gabrielmmoraes1999.seadb.DataType;
+import io.github.gabrielmmoraes1999.seadb.ParameterMeta;
 import io.github.gabrielmmoraes1999.seadb.SeaException;
 import io.github.gabrielmmoraes1999.seadb.ReferentialAction;
 import io.github.gabrielmmoraes1999.seadb.Row;
@@ -50,6 +51,9 @@ public final class Wire {
     public static final byte BACKUP_READ = 10;
     public static final byte BACKUP_FINISH = 11;
     public static final byte BACKUP_ABORT = 12;
+    public static final byte DESCRIBE_PARAMETERS = 13;
+    public static final byte FETCH = 14;
+    public static final byte CANCEL = 15;
 
     private static final byte V_NULL = 0;
     private static final byte V_BOOLEAN = 1;
@@ -69,6 +73,9 @@ public final class Wire {
     private static final byte V_SQL_TIME = 15;
     private static final byte V_SQL_TIMESTAMP = 16;
     private static final byte V_UTIL_DATE = 17;
+    private static final byte V_UUID = 18;
+    private static final byte V_INTERVAL = 19;
+    private static final byte V_TIMESTAMPTZ = 20;
 
     private Wire() {
     }
@@ -83,10 +90,10 @@ public final class Wire {
     public record SessionView(String user, String schema, boolean transactionActive, boolean ownsTransaction) {
     }
 
-    public record ExecuteRequest(String sql, Object[] params) {
+    public record ExecuteRequest(String sql, Object[] params, Integer fetch, Integer timeout) {
     }
 
-    public record ExecuteReply(SqlResult result, String schema, boolean transactionActive, boolean ownsTransaction) {
+    public record ExecuteReply(SqlResult result, String schema, boolean transactionActive, boolean ownsTransaction, long cursor) {
     }
 
     public record StateView(String schema, boolean transactionActive, boolean ownsTransaction) {
@@ -179,13 +186,70 @@ public final class Wire {
         return new SessionView(user, state.schema(), state.transactionActive(), state.ownsTransaction());
     }
 
+    public static byte[] encodeDescribe(String sql) {
+        return bytes(out -> writeUtf(out, sql == null ? "" : sql));
+    }
+
+    public static String decodeDescribe(byte[] body) throws IOException {
+        return readUtf(input(body));
+    }
+
+    public static byte[] encodeParameters(List<ParameterMeta> parameters) {
+        List<ParameterMeta> values = parameters == null ? List.of() : parameters;
+        return bytes(out -> {
+            out.writeInt(values.size());
+            for (ParameterMeta meta : values) {
+                writeUtf(out, meta.type().name());
+                out.writeInt(meta.precision());
+                out.writeInt(meta.scale());
+                out.writeBoolean(meta.nullable());
+            }
+        });
+    }
+
+    public static List<ParameterMeta> decodeParameters(byte[] body) throws IOException {
+        DataInputStream in = input(body);
+        int count = in.readInt();
+        if (count < 0 || count > MAX_FRAME) {
+            throw new IOException("invalid frame");
+        }
+        List<ParameterMeta> parameters = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            DataType type;
+            try {
+                type = DataType.valueOf(readUtf(in));
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("unknown parameter type");
+            }
+            int precision = in.readInt();
+            int scale = in.readInt();
+            boolean nullable = in.readBoolean();
+            parameters.add(new ParameterMeta(type, precision, scale, nullable));
+        }
+        return parameters;
+    }
+
     public static byte[] encodeExecute(String sql, Object[] params) {
+        return encodeExecute(sql, params, 0, 0);
+    }
+
+    public static byte[] encodeExecute(String sql, Object[] params, int fetch) {
+        return encodeExecute(sql, params, fetch, 0);
+    }
+
+    public static byte[] encodeExecute(String sql, Object[] params, int fetch, int timeout) {
         Object[] values = params == null ? new Object[0] : params;
         return bytes(out -> {
             writeUtf(out, sql);
             out.writeInt(values.length);
             for (Object value : values) {
                 writeValue(out, value);
+            }
+            if (fetch > 0 || timeout > 0) {
+                out.writeInt(Math.max(fetch, 0));
+            }
+            if (timeout > 0) {
+                out.writeInt(timeout);
             }
         });
     }
@@ -201,7 +265,27 @@ public final class Wire {
         for (int i = 0; i < count; i++) {
             params[i] = readValue(in);
         }
-        return new ExecuteRequest(sql, params);
+        Integer fetch = null;
+        Integer timeout = null;
+        if (in.available() >= 4) {
+            fetch = in.readInt();
+        }
+        if (in.available() >= 4) {
+            timeout = in.readInt();
+        }
+        return new ExecuteRequest(sql, params, fetch, timeout);
+    }
+
+    public static byte[] encodeFetch(long cursor, int count) {
+        return bytes(out -> {
+            out.writeLong(cursor);
+            out.writeInt(count);
+        });
+    }
+
+    public static long[] decodeFetch(byte[] body) throws IOException {
+        DataInputStream in = input(body);
+        return new long[]{in.readLong(), in.readInt()};
     }
 
     public static byte[] encodeExecuteOk(SqlResult result, String schema, boolean transactionActive, boolean ownsTransaction) {
@@ -225,6 +309,9 @@ public final class Wire {
                 out.writeInt(result.affectedRows());
             }
             writeState(out, schema, transactionActive, ownsTransaction);
+            if (result.cursor() != 0) {
+                out.writeLong(result.cursor());
+            }
         });
     }
 
@@ -262,7 +349,11 @@ public final class Wire {
             result = SqlResult.update(in.readInt());
         }
         StateView state = readState(in);
-        return new ExecuteReply(result, state.schema(), state.transactionActive(), state.ownsTransaction());
+        long cursor = in.available() >= 8 ? in.readLong() : 0L;
+        if (cursor != 0) {
+            result = result.withCursor(cursor);
+        }
+        return new ExecuteReply(result, state.schema(), state.transactionActive(), state.ownsTransaction(), cursor);
     }
 
     public static byte[] encodeSchema(String schema) {
@@ -400,11 +491,26 @@ public final class Wire {
     }
 
     public static byte[] encodeError(String message) {
-        return bytes(out -> writeUtf(out, message == null || message.isBlank() ? "server error" : message));
+        return encodeError(message, null);
+    }
+
+    public static byte[] encodeError(String message, String sqlState) {
+        return bytes(out -> {
+            writeUtf(out, message == null || message.isBlank() ? "server error" : message);
+            if (sqlState != null && !sqlState.isBlank() && !"42000".equals(sqlState)) {
+                writeUtf(out, sqlState);
+            }
+        });
     }
 
     public static String decodeError(byte[] body) throws IOException {
         return readUtf(input(body));
+    }
+
+    public static String decodeErrorState(byte[] body) throws IOException {
+        DataInputStream in = input(body);
+        readUtf(in);
+        return in.available() > 0 ? readUtf(in) : "42000";
     }
 
     private static void writeState(DataOutputStream out, String schema, boolean transactionActive, boolean ownsTransaction)
@@ -619,6 +725,16 @@ public final class Wire {
         } else if (value instanceof Date date) {
             out.writeByte(V_UTIL_DATE);
             out.writeLong(date.getTime());
+        } else if (value instanceof java.util.UUID id) {
+            out.writeByte(V_UUID);
+            writeUtf(out, id.toString());
+        } else if (value instanceof io.github.gabrielmmoraes1999.seadb.SqlInterval interval) {
+            out.writeByte(V_INTERVAL);
+            out.writeLong(interval.millis);
+        } else if (value instanceof java.time.OffsetDateTime stamp) {
+            out.writeByte(V_TIMESTAMPTZ);
+            out.writeLong(stamp.toInstant().toEpochMilli());
+            out.writeShort(stamp.getOffset().getTotalSeconds() / 60);
         } else {
             throw new SeaException("unsupported parameter type: " + value.getClass().getName());
         }
@@ -653,6 +769,10 @@ public final class Wire {
             case V_SQL_TIME -> java.sql.Time.valueOf(LocalTime.parse(readUtf(in)));
             case V_SQL_TIMESTAMP -> java.sql.Timestamp.valueOf(LocalDateTime.parse(readUtf(in)));
             case V_UTIL_DATE -> new Date(in.readLong());
+            case V_UUID -> java.util.UUID.fromString(readUtf(in));
+            case V_INTERVAL -> new io.github.gabrielmmoraes1999.seadb.SqlInterval(in.readLong());
+            case V_TIMESTAMPTZ -> java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochMilli(in.readLong()),
+                    java.time.ZoneOffset.ofTotalSeconds(in.readShort() * 60));
             default -> throw new IOException("invalid frame");
         };
     }

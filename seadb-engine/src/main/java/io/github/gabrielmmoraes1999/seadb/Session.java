@@ -12,6 +12,9 @@ public final class Session {
     final String role;
     private String schemaName = Relation.PUBLIC;
     private boolean closed;
+    /** JDBC isolation codes. The engine default is read committed. */
+    int isolation = 2;
+    volatile boolean cancelled;
 
     Session(String user, boolean admin, long attachmentId) {
         this(user, admin, attachmentId, null);

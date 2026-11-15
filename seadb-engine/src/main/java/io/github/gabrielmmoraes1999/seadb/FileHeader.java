@@ -25,7 +25,7 @@ final class FileHeader {
             throw new SeaException("file is not a SeaDB table");
         }
         int version = version(header);
-        if (version != Format.VERSION) {
+        if (!Format.known(version)) {
             throw new SeaException("unsupported file version: " + version);
         }
         return parseSlots(header);
@@ -40,9 +40,13 @@ final class FileHeader {
     }
 
     static byte[] fresh(long metaOffset, int metaLength) {
+        return fresh(Format.VERSION, metaOffset, metaLength);
+    }
+
+    static byte[] fresh(int version, long metaOffset, int metaLength) {
         byte[] header = new byte[Format.HEADER_SIZE];
         System.arraycopy(Format.MAGIC, 0, header, 0, Format.MAGIC.length);
-        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) Format.VERSION);
+        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) version);
         header[Format.SCRUB_OFFSET] = Format.SCRUB_CLEAN;
         writeSlot(header, 0, 1L, metaOffset, metaLength);
         return header;

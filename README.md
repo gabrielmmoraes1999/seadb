@@ -102,7 +102,7 @@ java -jar seadb-backup/target/seadb-backup-1.0.jar full jdbc:seadb://127.0.0.1:4
 
 ## Log translation
 
-`seadb-dbtran` writes the SQL from the transaction log. With no arguments, a window opens. With a log and a SQL file, the command writes the script and prints the percentage while it reads the file. The source is a `.log` or the `.db` beside it. Parameters are written into the text in place of each `?`. The window stores the last fields in `~/.seadb/dbtran.properties`. `--help` shows the usage.
+`seadb-dbtran` writes the SQL from the transaction log. With no arguments, a window opens. With a log and a SQL file, the command writes the script and prints the percentage while it reads the file. The source is a `.log` or the `.db` beside it. Parameters are written into the text in place of each `?`. The window stores the last fields in `~/.seadb/dbtran.properties`. `--help` shows the usage. The export contains every commit. `Database.applyLog` can stop at a time: a commit at or before that instant is replayed, a commit with no stored time is replayed, and a later commit is left out. If the checkpoint already stored that later commit's pages, they are undone the way an open transaction is undone.
 
 ```bash
 java -jar seadb-dbtran/target/seadb-dbtran-1.0.jar
@@ -112,7 +112,7 @@ java -jar seadb-dbtran/target/seadb-dbtran-1.0.jar C:/data/store.db C:/data/stor
 
 ## Network
 
-The `.db` file stays open in a single process, together with the `.log`. That process is `seadb-dbeng` on this machine, or `seadb-dbsrv` for other machines. Each one listens on a port and serves JDBC. The driver, in the `seadb-jdbc` project, talks to it through `jdbc:seadb://host:port/name` and also opens the file directly with `jdbc:seadb:embedded:`. The password travels in the clear on TCP, intended for the local network.
+The `.db` file stays open in a single process, together with the `.log`. That process is `seadb-dbeng` on this machine, or `seadb-dbsrv` for other machines. Each one listens on a port and serves JDBC. The driver, in the `seadb-jdbc` project, talks to it through `jdbc:seadb://host:port/name` and also opens the file directly with `jdbc:seadb:embedded:`. Without a keystore the password travels in the clear on TCP, intended for the local network. `seadb-dbsrv` accepts `--ssl-keystore` and `--ssl-password` for a PKCS12 file and then listens with TLS. The client URL is `jdbc:seadb://host:port/name?ssl=true&sslCert=<file>` and trusts only that certificate. The personal server rejects those two options and stays on `127.0.0.1`.
 
 `seadb-dbeng` is the personal server. `seadb-dbsrv` is the network server. With no database on the command line, the first window asks for the database file, the cache size, and the options. An empty options field starts the database. `-a banco.log` applies that log and the process exits when the apply finishes. `-x tcpip(port=4580)` changes the port. OK opens the message console, with a Shutdown button. OK also stores those three fields. The next time the window opens with no database and no options on the command line, it shows them again. The personal server writes `~/.seadb/dbeng.properties`. The network server writes `~/.seadb/dbsrv.properties`. A database file on the command line still skips the window and leaves the stored fields as they were.
 
@@ -135,6 +135,10 @@ try (Connection connection = DriverManager.getConnection(url, "dba", "dba")) {
 ```
 
 On this machine the personal server is `jdbc:seadb://127.0.0.1:4580/store`. The name after the port is the name from `-n` or from the file name, with no case distinction. Several connections on the server follow the rule of one transaction per file. While the server holds the `.db`, another process that tries to open the same file receives database already open. Shutdown releases the files.
+
+`SEA$CONFIG` `Max.Connections` refuses a new login with `connection limit reached` and SQLSTATE `08001` when the number of open sessions has reached that value. `0` means no limit. `Command.Timeout` is a limit in seconds for one statement. `0` means no limit. `Statement.setQueryTimeout` uses the smaller positive of the two. The scan, the match, and the index leaf stop with `command timed out`. `Statement.cancel()` asks the engine to stop the running statement with `command cancelled`.
+
+`SEA$CONFIG` `Audit.Log` set to `on` appends `<database>.audit` beside the file. Each statement records the time, the user, the connection id, `ok` or `fail`, and the SQL text. Parameter values are not written. When the option is off, the file is not created.
 
 ## Studio
 
@@ -242,9 +246,17 @@ Unquoted identifiers are case-insensitive. Quoted identifiers preserve case, and
 | `TIME`                                   | `TIME`       | `'13:45'` or `'13:45:01'`, `setTime`                               |
 | `TIMESTAMP`                              | `TIMESTAMP`  | `'2026-10-07 13:45:01'` or `'2026-10-07T13:45:01'`, `setTimestamp` |
 | `BLOB`, `BYTEA`, `BINARY`, or `VARBINARY` | `BLOB`       | `X'0102'`, `X''`, `setBytes`                                       |
+| `UUID`                                   | `OTHER`      | `'550e8400-e29b-41d4-a716-446655440000'` or `UUID '...'`           |
+| `JSON`                                   | `OTHER`      | a JSON text, `JSON_EXTRACT`, `JSON_TYPE`                           |
+| `INTERVAL DAY TO SECOND`                 | `OTHER`      | `INTERVAL '1 02:00:00' DAY TO SECOND`                              |
+| `TIMESTAMP WITH TIME ZONE`               | `TIMESTAMP_WITH_TIMEZONE` | `'2026-10-07 13:45:01+00'` or the same instant with another offset |
 
 
 `CHAR` and `VARCHAR` require a length from 1 to 8192. `DECIMAL` requires a precision from 1 to 38, and the scale does not exceed the precision. A table has at most 1024 columns.
+
+`UUID` is 16 bytes. The literal has 36 characters and hyphens, and hex letters may be upper or lower case. A read returns the canonical lowercase form. Comparison is unsigned binary. `JSON` stores text and rejects a value that is not JSON. `JSON_EXTRACT(doc, '$.a.b')` and `JSON_EXTRACT(doc, '$.a[0]')` return the selected value; `JSON_TYPE` returns `object`, `array`, `string`, `number`, `boolean`, or `null`. A null document returns null. `INTERVAL` accepts only `DAY TO SECOND` and is stored as milliseconds. Adding it to `DATE` returns `TIMESTAMP`; adding or subtracting it from `TIMESTAMP` keeps `TIMESTAMP`. `TIMESTAMP WITH TIME ZONE` stores the instant and the offset in minutes. A literal without an offset is UTC. Two equal instants with different offsets compare equal. `CURRENT_TIMESTAMP` stays the local clock without a zone, and the old `TIMESTAMP` type is unchanged.
+
+`VARCHAR(n) COLLATE UNICODE_CI` and `CHAR(n) COLLATE UNICODE_CI` compare without case and without accents. The index of that column uses the same comparison. The charset stored at creation does not change. The default collation remains binary UTF-8.
 
 `NULL` is null. Single quotes inside text are doubled: `'it''s'`. `X'0102'` is binary; the number of hexadecimal digits must be even.
 
@@ -295,6 +307,12 @@ DROP TABLE orders;
 ```
 
 `ALTER [COLUMN] ... POSITION` moves a column. Positions start at 1. The columns in between shift. `SELECT *`, `INSERT` without a column list, and the catalog follow the new order. The values stay on the column. A view keeps the column order it had when it was created.
+
+`ALTER TABLE t ALTER COLUMN c TYPE` converts every stored value. Null stays null. If one value does not fit, the table is left as it was. `SET NOT NULL` fails while any row is null. `DROP NOT NULL` is refused for a primary-key column. `SET DEFAULT` stores a literal or an expression, and `DROP DEFAULT` removes it. `RENAME COLUMN a TO b`, `RENAME TABLE a TO b`, and `ALTER TABLE a RENAME TO b` rename the object. A view or trigger that cites the table has the old identifier replaced in its stored text, including a homonym in that object. An object that does not cite the table is left as it was. `ROLLBACK` undoes the rename.
+
+`CHECK (expression)` can sit on a column or on the table, with an optional `CONSTRAINT` name. The expression sees columns of the same row. A null result passes; false fails with `check constraint failed` and the row is not written. `ALTER TABLE ... ADD CONSTRAINT ... CHECK` validates the rows already stored and leaves the table unchanged when one fails. `DROP CONSTRAINT` removes a check as well.
+
+`CREATE DOMAIN name AS type` accepts `DEFAULT` and `CHECK (VALUE ...)`. A column can use the domain in place of a type. `DROP DOMAIN` fails with `domain is in use` while a column still uses it. `GENERATED ALWAYS AS (expression) STORED` is calculated from the other columns of the row. An `INSERT` that names the column fails. Updating a base column recalculates it. A generated column cannot be a key or an index. A `DEFAULT` expression can use `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `GEN_ID`, and `NEXT VALUE FOR`. It is evaluated on `INSERT` when the column is omitted, on the clock frozen for that command. `GEN_ID` still advances when the row is rolled back. A check, a domain, a generated column, and a default expression do not see another row, a subquery, an aggregate, or a window.
 
 A table has one primary key. It can be a single column (`id INTEGER PRIMARY KEY`) or composite (`PRIMARY KEY (a, b)`), at creation or later with `ALTER TABLE ... ADD PRIMARY KEY`. The index is created with it, with the constraint name and Ascending order. Without an explicit name, both are called `PK_` plus the table name. `ADD CONSTRAINT PK_orders PRIMARY KEY (id)` stores that name. For another name or descending order:
 
@@ -380,18 +398,28 @@ An index name is unique within its schema. The primary key index, each `UNIQUE` 
 
 `DROP INDEX` finds the index by that name in the schema. Without a schema, it uses the session schema. `sales.idx_customer` selects the schema. `ON table` is optional and limits the search to that table.
 
-The entries live in 4096-byte pages in the table region. The file grows with the keys. An equality lookup reads only the pages on the path, from the root to the leaf, and the full key list does not stay in memory. The table rows are still loaded on open.
+The entries live in 4096-byte pages in the table region. The file grows with the keys. An equality lookup reads only the pages on the path, from the root to the leaf, and the full key list does not stay in memory. Opening a table keeps the directory of row offsets. A row body is read when that row is used.
 
-The plan uses the index when the `WHERE` has equalities joined by `AND`, with a literal or `?`, and those equalities cover a leftmost prefix of the index. An index on `(order_id, number)` is used for `order_id = 10` and for `order_id = 10 AND number = 2`. A predicate on `number` alone does not use that index.
+The plan uses the index when the `WHERE` has equalities joined by `AND`, with a literal or `?`, and those equalities cover a leftmost prefix of the index. An index on `(order_id, number)` is used for `order_id = 10` and for `order_id = 10 AND number = 2`. A predicate on `number` alone does not use that index. A range (`>`, `<`, `BETWEEN`, or `LIKE` with a fixed prefix) uses the same prefix. `OR` of equalities on one column uses the index when every branch matches.
 
 ```sql
 SELECT id FROM customer WHERE email = ?;
 SELECT * FROM item WHERE order_id = 10 AND number = 2;
 ```
 
-`LIKE`, `OR`, a range, and an expression stay out of that lookup, and the table is scanned.
+```sql
+CREATE INDEX idx_open ON orders (status) WHERE status = 'open';
+CREATE INDEX idx_lower ON customer (LOWER(email));
+CREATE INDEX idx_cover ON orders (customer_id) INCLUDE (number);
+ANALYZE;
+ANALYZE orders;
+```
 
-`CREATE`, `DROP`, and `ALTER` belong to the open transaction. `COMMIT` keeps them. `ROLLBACK` undoes them, so a dropped index comes back.
+A partial index stores a row only when the `WHERE` is true. The condition uses key columns, literals, `AND`, `OR`, `NOT`, comparison, `IS NULL`, and `BETWEEN`. A false or unknown result, including a comparison with `NULL`, leaves the row out. The plan uses that index only when the query `WHERE` implies the predicate. An expression index stores the value of a pure function (`LOWER`, `UPPER`, and the other functions without state) of a key column or a literal. `GEN_ID` and the current time are rejected at creation. The query uses the index when the predicate is the same call compared with a literal or `?`. `LOWER(NULL)` is not stored. `INCLUDE` stores extra columns in the leaf. A `BLOB` cannot be included. A lookup returns those columns without reading the row when the `SELECT` and the filter use only the key and the included columns. `UPDATE`, and a filter that names another column, read the row.
+
+`ANALYZE` counts the table and each index once and stores the counts, and the minimum and maximum of the leading key, in `SEA$STATISTICS`. It does not run on `INSERT`. Without that row the plan is unchanged. With it, an equality stays on the index. A range becomes a scan when the estimate is more than half the rows of the table. The estimate is the fraction of the stored minimum and maximum covered by the predicate, times the index entries. When the bounds cannot be compared, the index is still used.
+
+`CREATE`, `DROP`, `ANALYZE`, and `ALTER` belong to the open transaction. `COMMIT` keeps them. `ROLLBACK` undoes them, so a dropped index comes back. The log stores the SQL, and applying the log runs the command again.
 
 ### Rows
 
@@ -404,7 +432,16 @@ UPDATE customer SET name = ? WHERE id = ?;
 DELETE FROM item WHERE order_id = 1 AND number = 2;
 ```
 
-`INSERT ... SELECT` does not exist. The column list can be omitted when the values follow the table order.
+`INSERT ... SELECT` is parsed and does not run: the statement fails with `INSERT ... SELECT is not supported` and writes nothing. `EXPLAIN` in front of a `SELECT`, `INSERT ... SELECT`, `UPDATE`, or `DELETE` returns one text row per plan step (a scan, an index and its keys, `nested loop` or `hash`, `sort`, `aggregation`) and does not write. The column list can be omitted when the values follow the table order.
+
+```sql
+EXPLAIN SELECT id FROM customer WHERE email = 'ana@example.com';
+COMMENT ON TABLE customer IS 'people';
+COMMENT ON COLUMN customer.email IS 'login';
+COMMENT ON TABLE customer IS NULL;
+```
+
+`COMMENT ON` accepts `TABLE`, `COLUMN`, `VIEW`, `PROCEDURE`, `FUNCTION`, `INDEX`, and `SCHEMA`. The text is stored in `SEA$REMARKS`. An empty string fails and leaves the previous comment. `IS NULL` removes it. `ROLLBACK` undoes the change. JDBC fills `REMARKS` on `getTables`, `getColumns`, `getProcedures`, and `getProcedureColumns`.
 
 ### Queries
 
@@ -484,13 +521,19 @@ WITH active AS (
 SELECT name FROM active ORDER BY name;
 ```
 
-A view still stores one base relation. It can use `GROUP BY` and `HAVING` on that table. A view with `JOIN`, `UNION`, or `WITH` fails. `SELECT INTO` stays on one table. A cursor and `FOR SELECT` accept the same query clauses, except `LIMIT` and `OFFSET`.
+`NATURAL JOIN` and `JOIN USING (columns)` equate the shared columns and `SELECT *` emits each of those columns once. A null in the key does not match. A comma join is a cross join filtered by `WHERE`.
 
-Outside the dialect: subquery, `NATURAL JOIN`, `USING`, a comma join, `INSERT ... SELECT`, `WITH RECURSIVE`, and `SAVEPOINT`.
+A view stores the query text. It can read one table, or a `JOIN`, `UNION`, `WITH`, or subquery. `INSERT`, `UPDATE`, and `DELETE` fail with `view is read-only` unless an `INSTEAD OF` trigger of that event exists. The trigger receives `NEW` and `OLD` the way a table trigger does, `OLD` is read-only, and several triggers run in `POSITION` order. Without the trigger, the view is not written. `CREATE OR REPLACE VIEW` and `CREATE OR REPLACE PROCEDURE` replace the object in the same schema. If the output names change, or the procedure output types change, the command fails before writing and the old object remains.
+
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `SUM`, `COUNT`, `AVG`, `MIN`, and `MAX` accept `OVER (PARTITION BY ... ORDER BY ...)`. They run after `WHERE` and `GROUP BY`, in memory. The frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is the default of an aggregate that has `ORDER BY`; without `ORDER BY` the frame is the whole partition. `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, and `LEAD` require `ORDER BY`. `LAG` and `LEAD` take an offset and a default, and a row outside the frame is null. Nulls in a partition stay together, and a tie keeps arrival order. A window is rejected in `WHERE`. `SELECT *` cannot be combined with a window function.
+
+`SELECT INTO` stays on one table. A cursor and `FOR SELECT` accept the same query clauses, except `LIMIT` and `OFFSET`.
+
+Outside the dialect: `WITH RECURSIVE`, a window function in `WHERE`, a frame other than `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, and writing a view that has no `INSTEAD OF` trigger.
 
 ## ResultSet
 
-The result is read-only and fits in memory. You can move with `next`, `previous`, `first`, `last`, `absolute`, and `relative`. `CONCUR_UPDATABLE` and `TYPE_SCROLL_SENSITIVE` are rejected.
+The result is read-only. A simple `SELECT` without `DISTINCT`, `ORDER BY`, a window, or an aggregate is fetched in blocks of `setFetchSize` (64 when the size is 0). `TYPE_FORWARD_ONLY` keeps the current block and drops the previous one. `previous`, `first`, `last`, `absolute`, and `relative` read the remaining blocks and then move. Other queries still return the whole result. `CONCUR_UPDATABLE` and `TYPE_SCROLL_SENSITIVE` are rejected.
 
 A column is read by name or by index, starting at 1. `wasNull()` applies after a null read. `Statement.setMaxRows` limits how many rows go into the result.
 
@@ -615,19 +658,24 @@ try (ResultSet indexes = meta.getIndexInfo(null, null, "customer", false, false)
 
 ## Errors
 
-An SQL failure becomes an `SQLException`. A syntax message or a database-rule message uses SQLSTATE `42000`. A closed connection uses `08003`. `commit` or `rollback` with auto-commit on uses `25000`. A URL with no file uses `08001`. A blank user or password uses `28000`. A feature outside the driver, such as `CallableStatement`, `CLOB`, `ARRAY`, or a savepoint, throws `SQLFeatureNotSupportedException`. A procedure runs through SQL, with `EXECUTE PROCEDURE`.
+An SQL failure becomes an `SQLException`. A syntax message or a database-rule message uses SQLSTATE `42000`. A closed connection uses `08003`. `commit` or `rollback` with auto-commit on uses `25000`. A URL with no file, and a connection past `Max.Connections`, uses `08001`. A blank user or password uses `28000`. `CallableStatement` runs `EXECUTE PROCEDURE` and `{call name(...)}`. `ARRAY`, `REF`, and `ROWID` throw `SQLFeatureNotSupportedException`. `jdbcCompliant()` stays false. There is no physical `ROWID`.
 
 ## File and internal tables
 
 The database is the `.db` file: page 0 is the header, the catalog comes next, and each table occupies whole pages, with the `BLOB` stored in the table itself. Beside it is the `.log`, with the same name and a different extension (`store.db` and `store.log`). Each committed transaction is stored in that log, compressed, and commit writes the log before the pages. The checkpoint synchronizes the `.db` and keeps that history, from creation or the last full backup. The incremental backup copies only the `.log`. If the process crashes in the middle, the next open reapplies what remained after the checkpoint. `apply` decompresses the transactions and runs the SQL again against a `.db`. There is no folder of tables. The page size is the one chosen in `create`. `SEA$FORMAT` remains `1`.
 
-Thirteen tables are created with the file, among them `SEA$SCHEMAS` with the `public` row. `CREATE TABLE` adds the owner in `SEA$PRIVILEGES`. The `SEA$` prefix is reserved. `DROP`, `ALTER`, and `CREATE INDEX` on them fail. Identifiers may use `$`.
+The required catalog is created with the file, among them `SEA$SCHEMAS` with the `public` row. A new file also creates `SEA$STATISTICS`, `SEA$COLUMN_PRIVILEGES`, and `SEA$REMARKS`. An older file creates each of those the first time a command needs it, inside that command's transaction, so `ROLLBACK` undoes the rows. Opening an older file does not write. `CREATE TABLE` adds the owner in `SEA$PRIVILEGES`. The `SEA$` prefix is reserved. `DROP`, `ALTER`, and `CREATE INDEX` on them fail. Identifiers may use `$`.
+
+The file is not encrypted at rest. There is no replica, standby, cluster, or scheduled event.
 
 
 | Table                      | Purpose                                                             | Writes                          |
 | -------------------------- | ------------------------------------------------------------------- | ------------------------------- |
 | `SEA$DATABASE`             | name, description, owner, date, file version, and `SEA$PAGE_SIZE`  | read-only                       |
-| `SEA$CONFIG`               | key and value (`Auth.Hash`, `Default.CharacterSet`)                 | DBA                             |
+| `SEA$CONFIG`               | key and value (`Auth.Hash`, `Default.CharacterSet`, `Audit.Log`, `Max.Connections`, `Command.Timeout`) | DBA |
+| `SEA$STATISTICS`           | row and index counts from `ANALYZE`                                 | `ANALYZE`                       |
+| `SEA$COLUMN_PRIVILEGES`    | a privilege granted on one column                                   | `GRANT` and `REVOKE`            |
+| `SEA$REMARKS`              | comment text for a table, column, view, procedure, function, index, or schema | `COMMENT ON`          |
 | `SEA$USERS`                | users, salted password, active, and administrator                   | DBA                             |
 | `SEA$PRIVILEGES`           | what each user can do on each table                                 | `GRANT` and `REVOKE`            |
 | `SEA$CONNECTIONS`          | active connections: user, login, state, and remote origin           | the database itself             |
@@ -659,13 +707,20 @@ The DBA is allowed on every table. The user who creates a table becomes its owne
 
 ```sql
 GRANT SELECT ON customer TO ana;
+GRANT SELECT (email) ON customer TO ana;
+GRANT INSERT (name, email) ON customer TO ana;
 GRANT SELECT, INSERT ON customer TO ana WITH GRANT OPTION;
 GRANT ALL ON customer TO PUBLIC;
 REVOKE INSERT ON customer FROM ana;
+REVOKE SELECT (email) ON customer FROM ana;
 REVOKE ALL ON customer FROM PUBLIC;
 ```
 
-`ALL` covers `SELECT`, `INSERT`, `UPDATE`, and `DELETE`. It does not take away ownership. `GRANT` and `REVOKE` do not run in the middle of a transaction.
+`ALL` covers `SELECT`, `INSERT`, `UPDATE`, and `DELETE`. It does not include `EXECUTE` and it does not take away ownership. `GRANT` and `REVOKE` run in the open transaction. `COMMIT` keeps them. `ROLLBACK` undoes them.
+
+A grant without a column list covers every column. `SELECT`, `INSERT`, and `UPDATE` also accept a column list. `DELETE` with a column list is a syntax error. With only column grants, `SELECT *` returns the granted columns in table order. Naming a column that was not granted fails the statement with `column is not granted: email` and returns no partial projection. `INSERT` and `UPDATE` fail the whole statement. The owner, the DBA, and `OWNER` still see every column. A null in a granted column is null.
+
+`EXECUTE` is a separate privilege on a procedure or a function. The owner and the DBA can execute without a grant. `GRANT EXECUTE ON FUNCTION name TO user` and `GRANT EXECUTE ON PROCEDURE name TO user` allow another user, and `REVOKE EXECUTE` removes it. Without the grant, that user cannot execute.
 
 A role receives a table privilege and is granted to a user. At login, only the supplied role applies; with no role, `CURRENT_ROLE` is `NONE` and the role privilege does not apply. The DBA can use any existing role. The user who creates the role is its owner and can grant it. `WITH ADMIN OPTION` lets that user grant the role further. `PUBLIC` can receive the role as well. The role name cannot match a user, and it cannot be `NONE` or `PUBLIC`.
 
@@ -753,7 +808,9 @@ INTO name
 DO SUSPEND;
 ```
 
-A view is a stored `SELECT`, from one table or from another view. `SELECT` on it applies `WHERE`, a column list, `DISTINCT`, `ORDER BY`, and `LIMIT` on top of the result. `INSERT`, `UPDATE`, and `DELETE` fail: the view is read-only. The name cannot match a table. `DROP TABLE` or `DROP VIEW` fails while another view depends on the object. The owner or the DBA removes the view. `GRANT` and `REVOKE` use its name, with `ON` or `ON VIEW`. `SELECT *` uses the columns stored at creation. JDBC lists the type `VIEW`.
+A function is a stored routine that returns one value and does not use `SUSPEND`. It is called from `SELECT` and `WHERE`. `EXECUTE BLOCK` runs the same procedural dialect, with optional `(name type = expression)` parameters. `RETURNS` and `SUSPEND` are used only when written; otherwise the block runs and reports a count. `EXECUTE STATEMENT` evaluates a text, binds the arguments to `?`, and runs it as the current user in the routine's schema. `WHEN EXCEPTION INTO var DO` catches `EXCEPTION 'text'`. `WHEN ANY INTO var DO` catches any error raised in the block, including dynamic SQL. The variable receives the message. Without a handler, the error leaves the routine. The owner and the DBA execute a function; another user needs `GRANT EXECUTE`.
+
+A view is a stored `SELECT`, from one table, another view, a join, a union, or a subquery. `SELECT` on it applies `WHERE`, a column list, `DISTINCT`, `ORDER BY`, and `LIMIT` on top of the result. `INSERT`, `UPDATE`, and `DELETE` fail unless an `INSTEAD OF` trigger handles that event. The name cannot match a table. `DROP TABLE` or `DROP VIEW` fails while another view depends on the object. The owner or the DBA removes the view. `GRANT` and `REVOKE` use its name, with `ON` or `ON VIEW`. `SELECT *` uses the columns stored at creation. JDBC lists the type `VIEW`.
 
 ```sql
 CREATE VIEW active (person) AS

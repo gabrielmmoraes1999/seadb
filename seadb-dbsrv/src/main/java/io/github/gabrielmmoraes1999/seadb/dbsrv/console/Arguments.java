@@ -23,7 +23,9 @@ public record Arguments(
         String cache,
         Path applyLog,
         List<MotorConfig.DatabaseSpec> databases,
-        boolean help
+        boolean help,
+        Path sslKeystore,
+        String sslPassword
 ) {
 
     public static final int DEFAULT_PORT = 4580;
@@ -44,6 +46,8 @@ public record Arguments(
         Integer port = null;
         String cache = null;
         String applyText = null;
+        String keystoreText = null;
+        String sslPassword = null;
         List<MotorConfig.DatabaseSpec> databases = new ArrayList<>();
         boolean named = false;
         for (int i = 0; i < args.length; i++) {
@@ -52,7 +56,7 @@ public record Arguments(
                 throw new SeaException("missing argument\n\n" + usage(kind));
             }
             if (help(arg)) {
-                return new Arguments(kind, kind.defaultHost(), DEFAULT_PORT, DEFAULT_CACHE, null, List.of(), true);
+                return new Arguments(kind, kind.defaultHost(), DEFAULT_PORT, DEFAULT_CACHE, null, List.of(), true, null, null);
             }
             if (arg.startsWith("-")) {
                 switch (arg) {
@@ -74,6 +78,8 @@ public record Arguments(
                         }
                         applyText = value(args, ++i, "transaction log", kind);
                     }
+                    case "--ssl-keystore" -> keystoreText = value(args, ++i, "keystore", kind);
+                    case "--ssl-password" -> sslPassword = value(args, ++i, "keystore password", kind);
                     case "-x" -> {
                         Link link = link(value(args, ++i, "link", kind), kind);
                         if (link.host != null) {
@@ -120,7 +126,14 @@ public record Arguments(
             applyLog = applyLog.toAbsolutePath().normalize();
         }
         distinct(databases);
-        return new Arguments(kind, host, port, cache, applyLog, List.copyOf(databases), false);
+        if ((keystoreText == null) != (sslPassword == null)) {
+            throw new SeaException("TLS needs both --ssl-keystore and --ssl-password\n\n" + usage(kind));
+        }
+        if (keystoreText != null && kind == Kind.PERSONAL) {
+            throw new SeaException("the personal server does not accept TLS\n\n" + usage(kind));
+        }
+        Path keystore = keystoreText == null ? null : Path.of(keystoreText).toAbsolutePath().normalize();
+        return new Arguments(kind, host, port, cache, applyLog, List.copyOf(databases), false, keystore, sslPassword);
     }
 
     public static String usage(Kind kind) {
@@ -149,6 +162,8 @@ public record Arguments(
                   -p, --port <port>       TCP port. The default is 4580.
                   -x tcpip(port=<port>)   TCP port, written as tcpip(port=<port>).
                   --host <address>        %s
+                  --ssl-keystore <file>   PKCS12 keystore. The network server then requires TLS.
+                  --ssl-password <secret> Password of that keystore.
                   --help                  Show this text.
 
                 file.db=name publishes that file under name.

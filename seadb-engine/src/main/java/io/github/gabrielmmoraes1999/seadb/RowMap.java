@@ -78,6 +78,29 @@ final class RowMap {
         }
     }
 
+    /** True when this map records a deletion of {@code id}. */
+    boolean hidden(long id) {
+        if (local.containsKey(id)) {
+            return local.get(id) == null;
+        }
+        return parent != null && parent.hidden(id);
+    }
+
+    /** Records a deletion even when the row lives only in the on-disk directory. */
+    void hide(long id) {
+        if (frozen) {
+            throw new SeaException("internal failure: frozen row map");
+        }
+        StoredRow previous = get(id);
+        local.put(id, null);
+        if (previous != null) {
+            size--;
+            if (previous.dirty) {
+                dirtyCount--;
+            }
+        }
+    }
+
     void remove(long id) {
         if (frozen) {
             throw new SeaException("internal failure: frozen row map");

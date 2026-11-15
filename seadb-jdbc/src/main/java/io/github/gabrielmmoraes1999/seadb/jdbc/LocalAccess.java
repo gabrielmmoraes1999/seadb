@@ -1,5 +1,6 @@
 package io.github.gabrielmmoraes1999.seadb.jdbc;
 
+import io.github.gabrielmmoraes1999.seadb.ParameterMeta;
 import io.github.gabrielmmoraes1999.seadb.SeaException;
 import io.github.gabrielmmoraes1999.seadb.Session;
 import io.github.gabrielmmoraes1999.seadb.SqlResult;
@@ -48,9 +49,37 @@ final class LocalAccess implements DatabaseAccess {
     }
 
     @Override
-    public SqlResult execute(String sql, Object[] params) throws SQLException {
+    public List<ParameterMeta> describeParameters(String sql) throws SQLException {
         try {
-            return shared.database().execute(session, sql, params == null ? new Object[0] : params);
+            return shared.database().describeParameters(session, sql);
+        } catch (SeaException exception) {
+            throw Jdbc.wrap(exception);
+        }
+    }
+
+    public SqlResult execute(String sql, Object[] params) throws SQLException {
+        return execute(sql, params, 0);
+    }
+
+    public SqlResult execute(String sql, Object[] params, int fetch) throws SQLException {
+        return execute(sql, params, fetch, 0);
+    }
+
+    public SqlResult execute(String sql, Object[] params, int fetch, int timeoutSeconds) throws SQLException {
+        try {
+            return shared.database().execute(session, sql, params == null ? new Object[0] : params, fetch, timeoutSeconds);
+        } catch (SeaException exception) {
+            throw Jdbc.wrap(exception);
+        }
+    }
+
+    public void cancel() {
+        shared.database().cancel(session);
+    }
+
+    public SqlResult fetch(long cursor, int count) throws SQLException {
+        try {
+            return shared.database().fetch(session, cursor, count);
         } catch (SeaException exception) {
             throw Jdbc.wrap(exception);
         }

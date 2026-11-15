@@ -37,7 +37,7 @@ class DiskRowTest {
         try (DatabaseFile file = DatabaseFile.open(path, cache)) {
             cache.release(path);
             TableStore table = table(file);
-            assertEquals(64, table.rowMap().size());
+            assertEquals(0, table.rowMap().size());
             assertTrue(cache.resident() < cache.maximum(), "opening must not read all row pages");
             for (StoredRow row : table.scan()) {
                 assertEquals(Integer.toString((int) row.id) + "x".repeat(7000), table.value(row, 1));
@@ -66,7 +66,7 @@ class DiskRowTest {
             assertEquals(2, table.value(second, 0));
             // A fresh open still reads only metadata. Corruption is checked on access.
             TableStore reopened = table(file);
-            assertEquals(64, reopened.rowMap().size());
+            assertEquals(0, reopened.rowMap().size());
             assertThrows(SeaException.class, () -> reopened.value(reopened.row(1), 0));
         }
     }

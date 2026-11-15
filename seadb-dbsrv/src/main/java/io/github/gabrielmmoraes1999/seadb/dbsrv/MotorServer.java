@@ -85,7 +85,7 @@ public final class MotorServer implements AutoCloseable {
             for (MotorConfig.DatabaseSpec spec : config.databases()) {
                 opened.add(new Published(spec.name(), Database.attach(spec.path(), cache)));
             }
-            socket = bind(config.host(), config.port());
+            socket = bind(config.host(), config.port(), config.sslKeystore(), config.sslPassword());
             MotorServer server = new MotorServer(config.host(), socket, new CopyOnWriteArrayList<>(opened), log, cache);
             server.acceptor.start();
             try {
@@ -199,7 +199,11 @@ public final class MotorServer implements AutoCloseable {
     }
 
     private static ServerSocket bind(String host, int port) throws IOException {
-        ServerSocket socket = new ServerSocket();
+        return bind(host, port, null, null);
+    }
+
+    private static ServerSocket bind(String host, int port, java.nio.file.Path keystore, String password) throws IOException {
+        ServerSocket socket = keystore == null ? new ServerSocket() : ssl(keystore, password);
         try {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress(host, port));
@@ -211,6 +215,25 @@ public final class MotorServer implements AutoCloseable {
                 // the bind error is the one that matters
             }
             throw exception;
+        }
+    }
+
+    private static ServerSocket ssl(java.nio.file.Path keystore, String password) throws IOException {
+        try {
+            java.security.KeyStore store = java.security.KeyStore.getInstance("PKCS12");
+            try (java.io.InputStream input = java.nio.file.Files.newInputStream(keystore)) {
+                store.load(input, password == null ? new char[0] : password.toCharArray());
+            }
+            javax.net.ssl.KeyManagerFactory keys = javax.net.ssl.KeyManagerFactory.getInstance(
+                    javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+            keys.init(store, password == null ? new char[0] : password.toCharArray());
+            javax.net.ssl.SSLContext context = javax.net.ssl.SSLContext.getInstance("TLS");
+            context.init(keys.getKeyManagers(), null, null);
+            return context.getServerSocketFactory().createServerSocket();
+        } catch (IOException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new IOException(exception.getMessage(), exception);
         }
     }
 
@@ -301,14 +324,62 @@ public final class MotorServer implements AutoCloseable {
                             Wire.writeFrame(out, Wire.OK, Wire.encodeLoginOk(
                                     session.user(), session.schema(), false, false));
                         }
+                        case Wire.DESCRIBE_PARAMETERS -> {
+                            require(session);
+                            String sql = Wire.decodeDescribe(frame.body());
+                            Wire.writeFrame(out, Wire.OK, Wire.encodeParameters(current.describeParameters(session, sql)));
+                        }
                         case Wire.EXECUTE -> {
                             require(session);
                             Wire.ExecuteRequest request = Wire.decodeExecute(frame.body());
                             log.statement(current.name, session.user(), request.sql());
-                            Reply reply = current.execute(session, request.sql(), request.params());
+                            int fetch = request.fetch() == null ? 0 : request.fetch();
+                            int timeout = request.timeout() == null ? 0 : request.timeout();
+                            Reply[] reply = new Reply[1];
+                            RuntimeException[] failure = new RuntimeException[1];
+                            Published running = current;
+                            Session caller = session;
+                            Thread worker = Thread.ofVirtual().start(() -> {
+                                try {
+                                    reply[0] = running.execute(caller, request.sql(), request.params(), fetch, timeout);
+                                } catch (RuntimeException exception) {
+                                    failure[0] = exception;
+                                }
+                            });
+                            while (worker.isAlive()) {
+                                if (socket.getInputStream().available() > 0) {
+                                    Wire.Frame extra = Wire.readFrame(in);
+                                    if (extra.opcode() == Wire.CANCEL) {
+                                        current.cancel(session);
+                                    }
+                                }
+                                try {
+                                    worker.join(20);
+                                } catch (InterruptedException exception) {
+                                    Thread.currentThread().interrupt();
+                                    current.cancel(session);
+                                    throw new SeaException("command cancelled");
+                                }
+                            }
+                            if (failure[0] != null) {
+                                throw failure[0];
+                            }
                             boolean open = current.transactionOpen(session);
                             Wire.writeFrame(out, Wire.OK, Wire.encodeExecuteOk(
-                                    reply.result(), reply.schema(), open, open));
+                                    reply[0].result(), reply[0].schema(), open, open));
+                        }
+                        case Wire.CANCEL -> {
+                            require(session);
+                            current.cancel(session);
+                            throw new SeaException("command cancelled");
+                        }
+                        case Wire.FETCH -> {
+                            require(session);
+                            long[] fetch = Wire.decodeFetch(frame.body());
+                            SqlResult block = current.fetch(session, fetch[0], (int) fetch[1]);
+                            boolean open = current.transactionOpen(session);
+                            Wire.writeFrame(out, Wire.OK, Wire.encodeExecuteOk(
+                                    block, session.schema(), open, open));
                         }
                         case Wire.SET_SCHEMA -> {
                             require(session);
@@ -376,7 +447,7 @@ public final class MotorServer implements AutoCloseable {
                         default -> throw new IOException("unknown command");
                     }
                 } catch (SeaException exception) {
-                    Wire.writeFrame(out, Wire.FAIL, Wire.encodeError(exception.getMessage()));
+                    Wire.writeFrame(out, Wire.FAIL, Wire.encodeError(exception.getMessage(), exception.sqlState()));
                 }
             }
         } catch (EOFException ignored) {
@@ -476,14 +547,32 @@ public final class MotorServer implements AutoCloseable {
             }
         }
 
-        private Reply execute(Session session, String sql, Object[] params) {
+        private List<io.github.gabrielmmoraes1999.seadb.ParameterMeta> describeParameters(Session session, String sql) {
+            synchronized (database) {
+                ensure(session);
+                return database.describeParameters(session, sql);
+            }
+        }
+
+        private Reply execute(Session session, String sql, Object[] params, int fetch, int timeout) {
             synchronized (database) {
                 ensure(session);
                 if (backupSession == session) {
                     throw new SeaException("a backup is in progress on this connection");
                 }
-                SqlResult result = database.execute(session, sql, params == null ? new Object[0] : params);
+                SqlResult result = database.execute(session, sql, params == null ? new Object[0] : params, fetch, timeout);
                 return new Reply(result, session.schema());
+            }
+        }
+
+        private void cancel(Session session) {
+            database.cancel(session);
+        }
+
+        private SqlResult fetch(Session session, long cursor, int count) {
+            synchronized (database) {
+                ensure(session);
+                return database.fetch(session, cursor, count);
             }
         }
 

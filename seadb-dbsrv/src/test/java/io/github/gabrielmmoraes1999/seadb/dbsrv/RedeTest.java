@@ -153,4 +153,32 @@ class RedeTest {
             assertFalse(rows.next());
         }
     }
+
+    @Test
+    void tlsUsesTheGivenCertificate() throws Exception {
+        Path file = dir.resolve("tls.db");
+        Database.create(file, DatabaseOptions.defaults());
+        Path store = dir.resolve("server.p12");
+        Path cert = dir.resolve("server.cer");
+        String keytool = Path.of(System.getProperty("java.home"), "bin", "keytool.exe").toString();
+        assertEquals(0, new ProcessBuilder(keytool, "-genkeypair", "-alias", "seadb", "-keyalg", "RSA",
+                "-storetype", "PKCS12", "-keystore", store.toString(), "-storepass", "secret",
+                "-dname", "CN=localhost", "-validity", "1").inheritIO().start().waitFor());
+        assertEquals(0, new ProcessBuilder(keytool, "-exportcert", "-alias", "seadb", "-storetype", "PKCS12",
+                "-keystore", store.toString(), "-storepass", "secret", "-file", cert.toString())
+                .inheritIO().start().waitFor());
+        MotorConfig config = new MotorConfig("127.0.0.1", 0,
+                List.of(new MotorConfig.DatabaseSpec("tls", file)), store, "secret");
+        try (MotorServer server = MotorServer.start(config)) {
+            String plain = "jdbc:seadb://127.0.0.1:" + server.port() + "/tls";
+            assertThrows(SQLException.class, () -> DriverManager.getConnection(plain, "dba", "dba"));
+            String encoded = java.net.URLEncoder.encode(cert.toAbsolutePath().toString(), java.nio.charset.StandardCharsets.UTF_8);
+            String url = plain + "?ssl=true&sslCert=" + encoded;
+            try (Connection connection = DriverManager.getConnection(url, "dba", "dba");
+                 ResultSet rows = connection.createStatement().executeQuery("SELECT 1")) {
+                assertTrue(rows.next());
+                assertEquals(1, rows.getInt(1));
+            }
+        }
+    }
 }

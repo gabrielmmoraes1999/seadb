@@ -5,7 +5,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.UUID;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
@@ -47,6 +49,10 @@ final class Values {
             case TIMESTAMP -> toTimestamp(value);
             case DECIMAL -> toDecimal(value, length, scale);
             case BLOB -> toBytes(value);
+            case UUID -> toUuid(value);
+            case JSON -> toJson(value);
+            case INTERVAL -> toInterval(value);
+            case TIMESTAMPTZ -> toOffsetTimestamp(value);
         };
     }
 
@@ -333,6 +339,16 @@ final class Values {
         if (left instanceof byte[] leftBytes && right instanceof byte[] rightBytes) {
             return Arrays.compareUnsigned(leftBytes, rightBytes);
         }
+        if (left instanceof UUID leftId && right instanceof UUID rightId) {
+            int cmp = Long.compareUnsigned(leftId.getMostSignificantBits(), rightId.getMostSignificantBits());
+            return cmp != 0 ? cmp : Long.compareUnsigned(leftId.getLeastSignificantBits(), rightId.getLeastSignificantBits());
+        }
+        if (left instanceof SqlInterval leftInterval && right instanceof SqlInterval rightInterval) {
+            return Long.compare(leftInterval.millis, rightInterval.millis);
+        }
+        if (left instanceof OffsetDateTime leftStamp && right instanceof OffsetDateTime rightStamp) {
+            return leftStamp.toInstant().compareTo(rightStamp.toInstant());
+        }
         BigDecimal leftNumber = asDecimal(left);
         BigDecimal rightNumber = asDecimal(right);
         if (leftNumber != null && rightNumber != null) {
@@ -445,7 +461,62 @@ final class Values {
         if (value instanceof String) {
             return "VARCHAR";
         }
+        if (value instanceof UUID) {
+            return "UUID";
+        }
+        if (value instanceof SqlInterval) {
+            return "INTERVAL";
+        }
+        if (value instanceof OffsetDateTime) {
+            return "TIMESTAMPTZ";
+        }
         return value.getClass().getSimpleName();
+    }
+
+    static UUID toUuid(Object value) {
+        if (value instanceof UUID id) {
+            return id;
+        }
+        String text = String.valueOf(value).trim();
+        try {
+            UUID id = UUID.fromString(text);
+            if (text.length() != 36 || text.charAt(8) != '-') {
+                throw new IllegalArgumentException();
+            }
+            return id;
+        } catch (IllegalArgumentException exception) {
+            throw new SeaException("invalid UUID: " + display(value));
+        }
+    }
+
+    static String toJson(Object value) {
+        String text = value instanceof String string ? string : String.valueOf(value);
+        JsonDoc.check(text);
+        return text;
+    }
+
+    static SqlInterval toInterval(Object value) {
+        if (value instanceof SqlInterval interval) {
+            return interval;
+        }
+        return SqlInterval.parse(String.valueOf(value));
+    }
+
+    static OffsetDateTime toOffsetTimestamp(Object value) {
+        if (value instanceof OffsetDateTime stamp) {
+            return stamp;
+        }
+        if (value instanceof LocalDateTime local) {
+            return local.atOffset(ZoneOffset.UTC);
+        }
+        String text = String.valueOf(value).trim().replace('T', ' ');
+        int sign = Math.max(text.lastIndexOf('+'), text.lastIndexOf('-'));
+        if (sign > 10) {
+            String offset = text.substring(sign);
+            LocalDateTime local = toTimestamp(text.substring(0, sign).trim());
+            return local.atOffset(ZoneOffset.of(offset));
+        }
+        return toTimestamp(text).atOffset(ZoneOffset.UTC);
     }
 
     static boolean like(String text, String pattern, char escape) {

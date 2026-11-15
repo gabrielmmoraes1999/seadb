@@ -138,19 +138,33 @@ public final class Database implements AutoCloseable {
      */
     public static void applyLog(Path database, Path log, Cache cache, IntConsumer applied,
                                 Consumer<String> messages) {
+        applyLog(database, log, cache, applied, messages, null);
+    }
+
+    /**
+     * Applies commits at or before {@code until}. A commit record without a time is applied.
+     * A later commit is left out, and pages already stored for it are undone.
+     */
+    public static void applyLog(Path database, Path log, Cache cache, IntConsumer applied,
+                                Consumer<String> messages, java.time.Instant until) {
         if (database == null) {
             throw new SeaException("database file is required");
         }
         if (log == null) {
             throw new SeaException("transaction log is required");
         }
-        long checkpoint;
-        try (Engine engine = Engine.openApplying(database, cache, messages)) {
-            if (messages != null) messages.accept("Applying committed transactions from " + log);
-            engine.applyExternalLog(log, applied);
-            checkpoint = engine.checkpointLsn();
+        ReplayCut.arm(until);
+        try {
+            long checkpoint;
+            try (Engine engine = Engine.openApplying(database, cache, messages)) {
+                if (messages != null) messages.accept("Applying committed transactions from " + log);
+                engine.applyExternalLog(log, applied);
+                checkpoint = engine.checkpointLsn();
+            }
+            if (messages != null) messages.accept("Checkpoint applied at log offset " + checkpoint);
+        } finally {
+            ReplayCut.clear();
         }
-        if (messages != null) messages.accept("Checkpoint applied at log offset " + checkpoint);
     }
 
     /**
@@ -437,6 +451,26 @@ public final class Database implements AutoCloseable {
         }
     }
 
+    public SqlResult execute(Session session, String sql, Object[] params, int fetch) {
+        return execute(session, sql, params, fetch, 0);
+    }
+
+    public SqlResult execute(Session session, String sql, Object[] params, int fetch, int timeoutSeconds) {
+        synchronized (engine) {
+            return engine.execute(session, sql, params, fetch, timeoutSeconds);
+        }
+    }
+
+    public void cancel(Session session) {
+        engine.cancel(session);
+    }
+
+    public SqlResult fetch(Session session, long cursor, int count) {
+        synchronized (engine) {
+            return engine.fetchCursor(session, cursor, count);
+        }
+    }
+
     public Session login(String user, String password) {
         return login(user, password, null, null);
     }
@@ -478,6 +512,24 @@ public final class Database implements AutoCloseable {
             throw new SeaException("the statement returned rows; use query or execute");
         }
         return result.affectedRows();
+    }
+
+    /**
+     * Types of the {@code ?} placeholders. Nothing is executed and nothing is written.
+     */
+    public List<ParameterMeta> describeParameters(String sql) {
+        synchronized (engine) {
+            if (owner == null || owner.closed()) {
+                throw new SeaException("session closed");
+            }
+            return engine.describeParameters(owner, sql);
+        }
+    }
+
+    public List<ParameterMeta> describeParameters(Session session, String sql) {
+        synchronized (engine) {
+            return engine.describeParameters(session, sql);
+        }
     }
 
     public SqlResult query(String sql, Object... params) {

@@ -41,6 +41,9 @@ final class Engine implements AutoCloseable {
     private Long transactionId;
     private Session installed;
     private final Map<Session, OpenTxn> transactions = new IdentityHashMap<>();
+    private final Map<TableStore, Map<Long, Session>> rowLocks = new IdentityHashMap<>();
+    private final Map<Session, Session> waiting = new IdentityHashMap<>();
+    private Set<String> joinKeys = Set.of();
     private int contextDepth;
     private LocalDateTime contextNow;
     private Session connected;
@@ -48,6 +51,10 @@ final class Engine implements AutoCloseable {
     private boolean bypass;
     private boolean suppressCapture;
     private int captureDepth;
+    private int requestedFetch;
+    private int requestedTimeout;
+    private long nextCursor;
+    private final java.util.IdentityHashMap<Session, java.util.Map<Long, PendingQuery>> openCursors = new java.util.IdentityHashMap<>();
     private final List<TransactionLog.Applied> pending = new ArrayList<>();
     private Session actor;
     private Object[] params = new Object[0];
@@ -59,10 +66,17 @@ final class Engine implements AutoCloseable {
     private int procedureDepth;
     private int routineDepth;
     private int viewDepth;
+    private int subqueryDepth;
+    private Evaluator correlation;
+    private SqlResult pendingWrite;
+    private int writeDepth;
     private Map<String, Held> cteScope;
     private Set<String> cteDefining = new HashSet<>();
     private List<Evaluator.Frame> inferFrames;
     private Map<TableStore, TableStore.Snapshot> statementSnapshots;
+    private final List<Runnable> renameUndo = new ArrayList<>();
+    private Object lastReturn;
+    private final Map<Projected, Map<Expr, Object>> orderWindows = new IdentityHashMap<>();
     private IdentityHashMap<TableStore, Set<Long>> deletingRows;
     private IdentityHashMap<TableStore, Set<Long>> rewritingRows;
     private String pinnedSchema;
@@ -219,6 +233,10 @@ final class Engine implements AutoCloseable {
                 throw new SeaException("user " + account.user + " does not have role " + active);
             }
         }
+        int limit = configInt("Max.Connections");
+        if (limit > 0 && attachments.size() >= limit) {
+            throw new SeaException("connection limit reached", "08001");
+        }
         return attach(account, active, remote);
     }
 
@@ -227,6 +245,7 @@ final class Engine implements AutoCloseable {
         if (session == null || session.closed()) {
             return;
         }
+        closeCursors(session);
         if (transactions.containsKey(session)) {
             rollbackSession(session);
         }
@@ -250,6 +269,69 @@ final class Engine implements AutoCloseable {
         }
     }
 
+    List<ParameterMeta> describeParameters(Session session, String sql) {
+        if (sql == null || sql.isBlank()) {
+            throw new SeaException("SQL is required");
+        }
+        Session previousActor = actor;
+        Session previousConnected = connected;
+        actor = session;
+        connected = session;
+        try {
+            ParsedSql parsed = SqlParser.parse(sql);
+            ParameterPlan.Catalog catalog = new ParameterPlan.Catalog() {
+                @Override
+                public Schema table(String name) {
+                    TableStore found = findTable(name);
+                    return found == null ? null : found.schema();
+                }
+
+                @Override
+                public List<ParamDef> inputs(String procedure) {
+                    StoredProcedure found = findProcedure(procedure);
+                    if (found == null) {
+                        return null;
+                    }
+                    return parameters(found.schema(), found.name(), 0);
+                }
+            };
+            List<ParameterMeta> described = new ArrayList<>();
+            for (Stmt statement : parsed.statements()) {
+                described.addAll(ParameterPlan.describe(statement, catalog));
+            }
+            while (described.size() < parsed.parameters()) {
+                described.add(ParameterMeta.unknown());
+            }
+            return described;
+        } finally {
+            actor = previousActor;
+            connected = previousConnected;
+        }
+    }
+
+    SqlResult execute(Session session, String sql, Object[] parameters, int fetch) {
+        return execute(session, sql, parameters, fetch, 0);
+    }
+
+    SqlResult execute(Session session, String sql, Object[] parameters, int fetch, int timeoutSeconds) {
+        int previous = requestedFetch;
+        int previousTimeout = requestedTimeout;
+        requestedFetch = fetch;
+        requestedTimeout = timeoutSeconds;
+        try {
+            return execute(session, sql, parameters);
+        } finally {
+            requestedFetch = previous;
+            requestedTimeout = previousTimeout;
+        }
+    }
+
+    void cancel(Session session) {
+        if (session != null) {
+            session.cancelled = true;
+        }
+    }
+
     SqlResult execute(Session session, String sql, Object[] parameters) {
         checkOpen();
         if (session != null && session.closed()) {
@@ -258,9 +340,11 @@ final class Engine implements AutoCloseable {
         boolean outer = contextDepth == 0;
         Session previousConnected = connected;
         if (outer) {
+            closeCursors(session);
             connected = session;
             contextDepth = 1;
             contextNow = null;
+            armPace(session);
         }
         Session previous = actor;
         actor = session;
@@ -274,8 +358,18 @@ final class Engine implements AutoCloseable {
                 pending.add(new TransactionLog.Applied(activeSchema(), sql, copy));
             }
             captureDepth++;
+            boolean userStatement = !suppressCapture && captureDepth == 1;
             try {
-                return executeBody(sql, parameters);
+                SqlResult result = executeBody(sql, parameters);
+                if (userStatement) {
+                    audit(sql, true);
+                }
+                return result;
+            } catch (RuntimeException exception) {
+                if (userStatement) {
+                    audit(sql, false);
+                }
+                throw exception;
             } finally {
                 captureDepth--;
             }
@@ -285,6 +379,9 @@ final class Engine implements AutoCloseable {
             }
             throw exception;
         } finally {
+            if (outer) {
+                Pace.clear();
+            }
             actor = previous;
             if (outer) {
                 boolean openTxn = session != null && transactions.containsKey(session);
@@ -602,6 +699,7 @@ final class Engine implements AutoCloseable {
     }
 
     private SqlResult dispatch(Stmt statement) {
+        pendingWrite = null;
         return switch (statement) {
             case BeginTx ignored -> {
                 if (actor != null && transactions.containsKey(actor)) {
@@ -645,6 +743,25 @@ final class Engine implements AutoCloseable {
                 } else {
                     throw new SeaException("there is no open transaction");
                 }
+                yield SqlResult.update(0);
+            }
+            case Savepoint savepoint -> {
+                makeSavepoint(savepoint.name());
+                yield SqlResult.update(0);
+            }
+            case RollbackTo rollbackTo -> {
+                rollbackToSavepoint(rollbackTo.name());
+                yield SqlResult.update(0);
+            }
+            case ReleaseSavepoint release -> {
+                releaseSavepoint(release.name());
+                yield SqlResult.update(0);
+            }
+            case SetIsolation set -> {
+                if (actor == null) {
+                    throw new SeaException("session closed");
+                }
+                actor.isolation = set.level();
                 yield SqlResult.update(0);
             }
             case Select select -> runQuery(select);
@@ -778,6 +895,55 @@ final class Engine implements AutoCloseable {
                 });
                 yield SqlResult.update(0);
             }
+            case AlterColumnType alter -> {
+                alterColumnType(alter);
+                yield SqlResult.update(0);
+            }
+            case AlterColumnNull alter -> {
+                alterColumnNull(alter);
+                yield SqlResult.update(0);
+            }
+            case AlterColumnDefault alter -> {
+                alterColumnDefault(alter);
+                yield SqlResult.update(0);
+            }
+            case RenameColumn alter -> {
+                renameColumn(alter);
+                yield SqlResult.update(0);
+            }
+            case RenameTable alter -> {
+                renameTable(alter);
+                yield SqlResult.update(0);
+            }
+            case AddCheck alter -> {
+                addCheck(alter);
+                yield SqlResult.update(0);
+            }
+            case CreateDomain domain -> {
+                createDomain(domain);
+                yield SqlResult.update(0);
+            }
+            case DropDomain domain -> {
+                dropDomain(domain);
+                yield SqlResult.update(0);
+            }
+            case GrantExecute grant -> {
+                grantExecute(grant.kind(), grant.name(), grant.user(), true);
+                yield SqlResult.update(0);
+            }
+            case RevokeExecute revoke -> {
+                grantExecute(revoke.kind(), revoke.name(), revoke.user(), false);
+                yield SqlResult.update(0);
+            }
+            case CreateFunction function -> {
+                createFunction(function);
+                yield SqlResult.update(0);
+            }
+            case DropFunction function -> {
+                dropFunction(function);
+                yield SqlResult.update(0);
+            }
+            case ExecuteBlock block -> executeBlock(block);
             case AddPrimaryKey add -> {
                 guardDdl(add.table());
                 rejectBorrowed(require(add.table()));
@@ -827,6 +993,18 @@ final class Engine implements AutoCloseable {
                     if (foreign) {
                         table.dropForeignKey(drop.name());
                         return 0;
+                    }
+                    for (CheckConstraint check : table.schema().checks) {
+                        if (Names.same(check.name, drop.name())) {
+                            List<CheckConstraint> kept = new ArrayList<>();
+                            for (CheckConstraint item : table.schema().checks) {
+                                if (!Names.same(item.name, drop.name())) {
+                                    kept.add(item);
+                                }
+                            }
+                            table.installSchema(table.schema().withChecks(kept));
+                            return 0;
+                        }
                     }
                     UniqueKey unique = uniqueNamed(table.schema(), drop.name());
                     if (unique == null) {
@@ -883,9 +1061,29 @@ final class Engine implements AutoCloseable {
                 });
                 yield SqlResult.update(0);
             }
-            case Insert insert -> SqlResult.update(insert(insert));
-            case Update update -> SqlResult.update(update(update));
-            case Delete delete -> SqlResult.update(delete(delete));
+            case Insert insert -> {
+                int count = insert(insert);
+                yield pendingWrite == null ? SqlResult.update(count) : pendingWrite;
+            }
+            case Update update -> {
+                int count = update(update);
+                yield pendingWrite == null ? SqlResult.update(count) : pendingWrite;
+            }
+            case Delete delete -> {
+                int count = delete(delete);
+                yield pendingWrite == null ? SqlResult.update(count) : pendingWrite;
+            }
+            case Truncate truncate -> SqlResult.update(truncate(truncate));
+            case Merge merge -> SqlResult.update(merge(merge));
+            case Analyze analyze -> {
+                analyze(analyze);
+                yield SqlResult.update(0);
+            }
+            case Explain explain -> explain(explain);
+            case Comment comment -> {
+                comment(comment);
+                yield SqlResult.update(0);
+            }
             case Grant grant -> {
                 grant(grant);
                 yield SqlResult.update(0);
@@ -923,6 +1121,7 @@ final class Engine implements AutoCloseable {
             claim(rel.schema(), schema, constraint, index, true);
             schema = schema.namePrimary(constraint, index, statement.primaryDescending());
         }
+        schema = schema.withChecks(tableChecks(schema, statement));
         for (ForeignClause clause : statement.foreignKeys()) {
             ForeignKey foreign = buildForeignKey(schema, rel.schema(), clause.constraint(), clause.columns(),
                     clause.index(), clause.descending(), clause.refTable(), clause.refColumns(),
@@ -999,9 +1198,9 @@ final class Engine implements AutoCloseable {
             }
             throw new SeaException("index already exists: " + statement.name());
         }
-        int[] columns = resolve(table.schema().columns, statement.columns(), "index");
+        IndexDef definition = IndexFeatures.define(table.schema(), statement);
         mutating(statement.table(), () -> {
-            require(statement.table()).createIndex(statement.name(), columns, statement.unique());
+            require(statement.table()).createIndex(definition);
             return 0;
         });
     }
@@ -1028,6 +1227,224 @@ final class Engine implements AutoCloseable {
             require(stored).dropIndex(indexName);
             return 0;
         });
+    }
+
+    private SqlResult explain(Explain statement) {
+        List<String> steps = new ArrayList<>();
+        explainStmt(statement.statement(), steps);
+        if (steps.isEmpty()) {
+            steps.add("scan");
+        }
+        List<ColumnMeta> columns = List.of(new ColumnMeta("plan", DataType.VARCHAR));
+        List<Row> rows = new ArrayList<>();
+        for (String step : steps) {
+            rows.add(new Row(columns, new Object[]{step}));
+        }
+        return SqlResult.query(columns, rows);
+    }
+
+    private void explainStmt(Stmt statement, List<String> steps) {
+        switch (statement) {
+            case Select select -> explainSelect(select, steps);
+            case Insert insert -> {
+                if (insert.source() instanceof Select select) {
+                    explainSelect(select, steps);
+                } else {
+                    steps.add("scan");
+                }
+            }
+            case Update update -> explainTable(update.table(), update.where(), steps);
+            case Delete delete -> explainTable(delete.table(), delete.where(), steps);
+            default -> steps.add("scan");
+        }
+    }
+
+    private void explainSelect(Select statement, List<String> steps) {
+        explainTable(statement.table(), statement.where(), steps);
+        for (Join join : statement.joins()) {
+            steps.add(joinHash(join) ? "hash" : "nested loop");
+        }
+        if (!statement.orderBy().isEmpty()) {
+            steps.add("sort");
+        }
+        boolean aggregate = !statement.groupBy().isEmpty();
+        if (!aggregate) {
+            for (SelectItem item : statement.items()) {
+                if (Evaluator.containsAggregate(item.expr())) {
+                    aggregate = true;
+                    break;
+                }
+            }
+        }
+        if (aggregate) {
+            steps.add("aggregation");
+        }
+    }
+
+    private void explainTable(String name, Expr where, List<String> steps) {
+        TableStore table = name == null ? null : findTable(name);
+        if (table == null) {
+            steps.add("scan");
+            return;
+        }
+        if (where == null) {
+            steps.add("scan " + table.schema().name);
+            return;
+        }
+        Evaluator evaluator = evaluator(table, null);
+        EqualsProbe probe = probeEquals(table.schema(), evaluator, where);
+        String index = probe.contradiction ? null
+                : table.explainIndex(probe.values, where, probe.calls);
+        steps.add(index == null ? "scan " + table.schema().name : index);
+    }
+
+    private boolean joinHash(Join join) {
+        if (!(join.on() instanceof Binary binary) || binary.op() != BinaryOp.EQ) {
+            return false;
+        }
+        TableStore right = findTable(join.relation());
+        if (right == null) {
+            return true;
+        }
+        ColumnRef column = binary.left() instanceof ColumnRef left ? left
+                : binary.right() instanceof ColumnRef rightRef ? rightRef : null;
+        if (column == null || right.schema().indexOf(column.name()) < 0) {
+            return true;
+        }
+        Map<Integer, Object> equals = new LinkedHashMap<>();
+        equals.put(right.schema().indexOf(column.name()), 0);
+        return right.explainIndex(equals, null, Map.of()) == null;
+    }
+
+    private void comment(Comment statement) {
+        String schema = statement.schema() == null || statement.schema().isBlank()
+                ? activeSchema() : Names.fold(statement.schema());
+        String name = Names.fold(statement.name());
+        String column = statement.column() == null ? "" : Names.fold(statement.column());
+        ensureRemarks();
+        systemExecute("""
+                DELETE FROM SEA$REMARKS
+                WHERE SEA$KIND = ? AND SEA$SCHEMA_NAME = ? AND SEA$OBJECT_NAME = ? AND SEA$COLUMN_NAME = ?
+                """, statement.kind(), schema, name, column);
+        if (statement.text() == null) {
+            return;
+        }
+        systemExecute("""
+                INSERT INTO SEA$REMARKS (
+                    SEA$KIND, SEA$SCHEMA_NAME, SEA$OBJECT_NAME, SEA$COLUMN_NAME, SEA$REMARK
+                ) VALUES (?, ?, ?, ?, ?)
+                """, statement.kind(), schema, name, column, statement.text());
+    }
+
+    private void ensureRemarks() {
+        if (systemTable(SystemTables.REMARKS) != null) {
+            return;
+        }
+        if (currentTxn() != null && !suppressCapture && !storage.leaveForRecovery()) {
+            checkpoint(true);
+        }
+        createStored(SystemTables.remarks(), Relation.PUBLIC);
+    }
+
+    private void analyze(Analyze statement) {
+        List<TableStore> targets = new ArrayList<>();
+        if (statement.table() != null) {
+            TableStore table = findTable(statement.table());
+            if (table == null) {
+                throw new SeaException("table not found: " + shown(statement.table()));
+            }
+            if (SystemTables.isSystem(table.schema().name)) {
+                throw new SeaException("system table cannot be analyzed: " + shown(statement.table()));
+            }
+            targets.add(table);
+        } else {
+            for (TableStore table : tables.values()) {
+                if (!SystemTables.isSystem(table.schema().name)) {
+                    targets.add(table);
+                }
+            }
+        }
+        ensureStatistics();
+        mutating(SystemTables.STATISTICS, () -> {
+            for (TableStore table : targets) {
+                writeStatistics(table);
+            }
+            return 0;
+        });
+    }
+
+    private void ensureStatistics() {
+        if (systemTable(SystemTables.STATISTICS) != null) {
+            return;
+        }
+        if (currentTxn() != null && !suppressCapture && !storage.leaveForRecovery()) {
+            checkpoint(true);
+        }
+        createStored(SystemTables.statistics(), Relation.PUBLIC);
+    }
+
+    private void writeStatistics(TableStore table) {
+        String schemaName = table.namespace() == null ? Relation.PUBLIC : table.namespace();
+        String relation = table.schema().name;
+        long[] rows = new long[1];
+        List<TableStore.IndexCensus> census = table.census(rows);
+        systemExecute(
+                "DELETE FROM SEA$STATISTICS WHERE SEA$SCHEMA_NAME = ? AND SEA$RELATION_NAME = ?",
+                schemaName, relation);
+        systemExecute("""
+                INSERT INTO SEA$STATISTICS (
+                    SEA$SCHEMA_NAME, SEA$RELATION_NAME, SEA$INDEX_NAME,
+                    SEA$CARDINALITY, SEA$INDEX_ENTRIES, SEA$LEADING_MIN, SEA$LEADING_MAX
+                ) VALUES (?, ?, '', ?, ?, NULL, NULL)
+                """, schemaName, relation, rows[0], rows[0]);
+        for (TableStore.IndexCensus index : census) {
+            systemExecute("""
+                    INSERT INTO SEA$STATISTICS (
+                        SEA$SCHEMA_NAME, SEA$RELATION_NAME, SEA$INDEX_NAME,
+                        SEA$CARDINALITY, SEA$INDEX_ENTRIES, SEA$LEADING_MIN, SEA$LEADING_MAX
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, schemaName, relation, index.name(), rows[0], index.entries(), index.min(), index.max());
+        }
+    }
+
+    private Map<String, TableStore.IndexStat> statistics(TableStore table) {
+        TableStore store = systemTable(SystemTables.STATISTICS);
+        if (store == null) {
+            return Map.of();
+        }
+        String schemaName = table.namespace() == null ? Relation.PUBLIC : table.namespace();
+        int schemaCol = store.schema().indexOf("SEA$SCHEMA_NAME");
+        int relationCol = store.schema().indexOf("SEA$RELATION_NAME");
+        int indexCol = store.schema().indexOf("SEA$INDEX_NAME");
+        int rowsCol = store.schema().indexOf("SEA$CARDINALITY");
+        int entriesCol = store.schema().indexOf("SEA$INDEX_ENTRIES");
+        int minCol = store.schema().indexOf("SEA$LEADING_MIN");
+        int maxCol = store.schema().indexOf("SEA$LEADING_MAX");
+        Map<String, TableStore.IndexStat> found = new HashMap<>();
+        for (StoredRow row : store.scan()) {
+            Object schema = store.value(row, schemaCol);
+            Object relation = store.value(row, relationCol);
+            if (!(schema instanceof String schemaText) || !Names.same(schemaText, schemaName)) {
+                continue;
+            }
+            if (!(relation instanceof String relationText) || !Names.same(relationText, table.schema().name)) {
+                continue;
+            }
+            Object index = store.value(row, indexCol);
+            if (index == null || String.valueOf(index).isEmpty()) {
+                continue;
+            }
+            Object rows = store.value(row, rowsCol);
+            Object entries = store.value(row, entriesCol);
+            if (!(rows instanceof Number rowCount) || !(entries instanceof Number entryCount)) {
+                continue;
+            }
+            Object min = store.value(row, minCol);
+            Object max = store.value(row, maxCol);
+            found.put(Names.fold(String.valueOf(index)), new TableStore.IndexStat(rowCount.longValue(), entryCount.longValue(),
+                    min == null ? null : String.valueOf(min), max == null ? null : String.valueOf(max)));
+        }
+        return found;
     }
 
     /**
@@ -1752,61 +2169,310 @@ final class Engine implements AutoCloseable {
     }
 
     private int insert(Insert statement) {
-        rejectView(statement.table());
+        StoredView instead = findView(statement.table());
+        if (instead != null) {
+            return insteadInsert(statement, instead);
+        }
+        if (statement.source() != null) {
+            throw new SeaException("INSERT ... SELECT is not supported");
+        }
+        boolean outer = writeDepth == 0;
+        writeDepth++;
+        try {
         return inSql(() -> mutating(statement.table(), () -> {
             guardMutation(statement.table(), "INSERT");
             TableStore table = require(statement.table());
             Schema schema = table.schema();
+            guardWritten(statement.table(), "INSERT", statement.columns(), schema);
+            if (statement.conflict() != null) {
+                requireConflict(schema, statement.conflict());
+            }
+            List<Object[]> incoming = incomingRows(statement, schema);
             int count = 0;
             boolean routines = !SystemTables.isSystem(schema.name);
-            for (List<Expr> expressions : statement.rows()) {
-                Object[] values = new Object[schema.columns.size()];
-                Arrays.fill(values, Values.MISSING);
-                Evaluator evaluator = evaluator(null, null);
-                if (statement.columns().isEmpty()) {
-                    if (expressions.size() != schema.columns.size()) {
-                        throw new SeaException("value count does not match the columns of " + schema.name);
+            List<Object[]> returned = new ArrayList<>();
+            List<Object[]> generated = new ArrayList<>();
+            for (Object[] values : incoming) {
+                StoredRow existing = statement.conflict() == null ? null : conflictRow(table, statement.conflict(), values);
+                if (existing != null) {
+                    if (statement.doNothing()) {
+                        continue;
                     }
-                    for (int i = 0; i < expressions.size(); i++) {
-                        values[i] = prepared(schema, schema.columns.get(i), evaluator.eval(expressions.get(i)));
-                    }
-                } else {
-                    if (expressions.size() != statement.columns().size()) {
-                        throw new SeaException("value count does not match the supplied columns");
-                    }
-                    Set<String> used = new HashSet<>();
-                    for (int i = 0; i < expressions.size(); i++) {
-                        String name = statement.columns().get(i);
-                        if (!used.add(Names.fold(name))) {
-                            throw new SeaException("duplicate column in INSERT: " + name);
-                        }
-                        int index = schema.indexOf(name);
+                    Object[] old = logical(table, existing);
+                    Object[] neu = old.clone();
+                    Evaluator evaluator = evaluator(table, null);
+                    evaluator.bind(existing);
+                    evaluator.bindExcluded(schema, values);
+                    for (Assignment assignment : statement.conflictSets()) {
+                        int index = schema.indexOf(assignment.column());
                         if (index < 0) {
-                            throw new SeaException("column not found: " + name);
+                            throw new SeaException("column not found: " + assignment.column());
                         }
-                        values[index] = prepared(schema, schema.columns.get(index), evaluator.eval(expressions.get(i)));
+                        neu[index] = prepared(schema, schema.columns.get(index), evaluator.eval(assignment.expr()));
                     }
+                    if (routines) {
+                        fireTriggers(table, "BEFORE", "UPDATE", old, neu);
+                    }
+                    applyGenerated(schema, neu);
+                    enforceChecks(schema, neu);
+                    replaceRow(table, existing, old, neu, routines);
+                    returned.add(neu);
+                    count++;
+                    continue;
                 }
+                fillDefaults(schema, values);
                 if (routines) {
                     fireTriggers(table, "BEFORE", "INSERT", null, values);
                 }
+                applyGenerated(schema, values);
+                enforceChecks(schema, values);
                 long id = table.insertOne(values);
+                Object[] stored = logical(table, rowById(table, id));
                 count++;
-                enforceOutgoing(table, logical(table, rowById(table, id)));
+                enforceOutgoing(table, stored);
                 if (routines) {
-                    fireTriggers(table, "AFTER", "INSERT", null, logical(table, rowById(table, id)));
+                    fireTriggers(table, "AFTER", "INSERT", null, stored);
                 }
+                returned.add(stored);
+                generated.add(stored);
+            }
+            if (outer) {
+                pendingWrite = writeResult(table, statement.returningAll(), statement.returning(), returned, generated, count);
             }
             return count;
         }));
+        } finally {
+            writeDepth--;
+        }
+    }
+
+    private List<Object[]> incomingRows(Insert statement, Schema schema) {
+        List<Object[]> incoming = new ArrayList<>();
+        if (statement.source() != null) {
+            SqlResult selected = runQuery(statement.source());
+            int width = statement.columns().isEmpty() ? schema.columns.size() : statement.columns().size();
+            if (selected.columns().size() != width) {
+                throw new SeaException("INSERT column count does not match");
+            }
+            for (int i = 0; i < selected.columns().size(); i++) {
+                DataType expected = statement.columns().isEmpty()
+                        ? schema.columns.get(i).type
+                        : schema.column(statement.columns().get(i)).type;
+                if (selected.columns().get(i).type() != expected) {
+                    throw new SeaException("INSERT column types do not match");
+                }
+            }
+            for (Row row : selected.rows()) {
+                incoming.add(place(schema, statement.columns(), rowValues(row)));
+            }
+            return incoming;
+        }
+        for (List<Expr> expressions : statement.rows()) {
+            if (statement.columns().isEmpty() && expressions.size() != schema.columns.size()) {
+                throw new SeaException("value count does not match the columns of " + schema.name);
+            }
+            if (!statement.columns().isEmpty() && expressions.size() != statement.columns().size()) {
+                throw new SeaException("value count does not match the supplied columns");
+            }
+            Evaluator evaluator = evaluator(null, null);
+            Object[] raw = new Object[expressions.size()];
+            for (int i = 0; i < expressions.size(); i++) {
+                raw[i] = evaluator.eval(expressions.get(i));
+            }
+            incoming.add(place(schema, statement.columns(), raw));
+        }
+        return incoming;
+    }
+
+    private Object[] place(Schema schema, List<String> columns, Object[] raw) {
+        Object[] values = new Object[schema.columns.size()];
+        Arrays.fill(values, Values.MISSING);
+        if (columns == null || columns.isEmpty()) {
+            for (int i = 0; i < raw.length; i++) {
+                if (schema.columns.get(i).generated != null) {
+                    throw new SeaException("cannot insert into generated column: " + schema.columns.get(i).name);
+                }
+                values[i] = prepared(schema, schema.columns.get(i), raw[i]);
+            }
+            return values;
+        }
+        Set<String> used = new HashSet<>();
+        for (int i = 0; i < columns.size(); i++) {
+            String name = columns.get(i);
+            if (!used.add(Names.fold(name))) {
+                throw new SeaException("duplicate column in INSERT: " + name);
+            }
+            int index = schema.indexOf(name);
+            if (index < 0) {
+                throw new SeaException("column not found: " + name);
+            }
+            if (schema.columns.get(index).generated != null) {
+                throw new SeaException("cannot insert into generated column: " + name);
+            }
+            values[index] = prepared(schema, schema.columns.get(index), raw[i]);
+        }
+        return values;
+    }
+
+    private void requireConflict(Schema schema, List<String> columns) {
+        int[] wanted = new int[columns.size()];
+        for (int i = 0; i < columns.size(); i++) {
+            int index = schema.indexOf(columns.get(i));
+            if (index < 0) {
+                throw new SeaException("column not found: " + columns.get(i));
+            }
+            wanted[i] = index;
+        }
+        if (sameColumns(schema.primaryKey, wanted)) {
+            return;
+        }
+        for (UniqueKey key : schema.uniques) {
+            if (sameColumns(key.columns, wanted)) {
+                return;
+            }
+        }
+        throw new SeaException("ON CONFLICT target is not a unique key");
+    }
+
+    private static boolean sameColumns(int[] left, int[] right) {
+        if (left.length != right.length) {
+            return false;
+        }
+        boolean[] used = new boolean[left.length];
+        for (int value : right) {
+            boolean hit = false;
+            for (int i = 0; i < left.length; i++) {
+                if (!used[i] && left[i] == value) {
+                    used[i] = true;
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private StoredRow conflictRow(TableStore table, List<String> columns, Object[] values) {
+        Map<Integer, Object> equals = new LinkedHashMap<>();
+        Schema schema = table.schema();
+        for (String name : columns) {
+            int index = schema.indexOf(name);
+            Object value = values[index];
+            if (value == null || value == Values.MISSING) {
+                return null;
+            }
+            equals.put(index, value);
+        }
+        List<StoredRow> found = table.lookup(equals);
+        if (found == null) {
+            found = new ArrayList<>();
+            for (StoredRow row : table.scan()) {
+                boolean match = true;
+                for (Map.Entry<Integer, Object> entry : equals.entrySet()) {
+                    Object current = table.value(row, entry.getKey());
+                    if (current == null || Values.compare(current, entry.getValue()) != 0) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    found.add(row);
+                }
+            }
+        }
+        if (found.size() > 1) {
+            throw new SeaException("ON CONFLICT matched more than one row");
+        }
+        return found.isEmpty() ? null : found.get(0);
+    }
+
+    private void replaceRow(TableStore table, StoredRow row, Object[] old, Object[] neu, boolean routines) {
+        Schema schema = table.schema();
+        Cell[] cells = row.copyCells();
+        for (int i = 0; i < neu.length; i++) {
+            if (!sameValue(old[i], neu[i])) {
+                cells[i] = TableStore.toCell(schema.columns.get(i), neu[i]);
+            }
+        }
+        Map<Long, Cell[]> replacements = new LinkedHashMap<>();
+        replacements.put(row.id, cells);
+        table.update(replacements);
+        if (referencedValuesChanged(table, old, neu)) {
+            blockReferentialUpdate(table, old, neu, row.id);
+        }
+        enforceOutgoing(table, neu);
+        if (routines) {
+            fireTriggers(table, "AFTER", "UPDATE", old, neu);
+        }
+    }
+
+    private SqlResult writeResult(TableStore table, boolean all, List<SelectItem> returning, List<Object[]> rows,
+                                  List<Object[]> generated, int count) {
+        Schema schema = table.schema();
+        List<Column> keys = new ArrayList<>();
+        for (Column column : schema.columns) {
+            if (column.autoIncrement) {
+                keys.add(column);
+            }
+        }
+        List<ColumnMeta> keyColumns = new ArrayList<>();
+        List<Row> keyRows = new ArrayList<>();
+        if (!keys.isEmpty()) {
+            if (keys.size() == 1) {
+                keyColumns.add(new ColumnMeta("GENERATED_KEY", keys.get(0).type));
+            } else {
+                for (Column column : keys) {
+                    keyColumns.add(new ColumnMeta(column.name, column.type));
+                }
+            }
+            for (Object[] row : generated) {
+                Object[] values = new Object[keys.size()];
+                for (int i = 0; i < keys.size(); i++) {
+                    values[i] = row[schema.indexOf(keys.get(i).name)];
+                }
+                keyRows.add(new Row(keyColumns, values));
+            }
+        }
+        if (!all && returning == null) {
+            return keyColumns.isEmpty() ? null : SqlResult.update(count, keyColumns, keyRows);
+        }
+        List<SelectItem> items = all ? star(schema) : returning;
+        List<ColumnMeta> columns = new ArrayList<>();
+        for (SelectItem item : items) {
+            columns.add(new ColumnMeta(item.label(), infer(item.expr(), schema)));
+        }
+        Evaluator evaluator = evaluator(table, null);
+        evaluator.useFrames(List.of(new Evaluator.Frame(schema, schema.name, schema.name, table.namespace(), null, 0, schema.columns.size())));
+        List<Row> out = new ArrayList<>();
+        for (Object[] values : rows) {
+            evaluator.bindJoined(values);
+            Object[] projected = new Object[items.size()];
+            for (int i = 0; i < items.size(); i++) {
+                projected[i] = materialize(evaluator.eval(items.get(i).expr()));
+            }
+            out.add(new Row(columns, projected));
+        }
+        return SqlResult.query(columns, out, keyColumns, keyRows);
     }
 
     private int update(Update statement) {
-        rejectView(statement.table());
+        StoredView instead = findView(statement.table());
+        if (instead != null) {
+            return insteadUpdate(statement, instead);
+        }
         return inSql(() -> mutating(statement.table(), () -> {
             guardMutation(statement.table(), "UPDATE");
             TableStore table = require(statement.table());
             Schema schema = table.schema();
+            List<String> written = new ArrayList<>();
+            for (Assignment assignment : statement.sets()) {
+                written.add(assignment.column());
+            }
+            guardWritten(statement.table(), "UPDATE", written, schema);
+            guardColumnUse(schema, whereScope(statement.table(), "UPDATE"), List.of(), statement.where());
             Set<String> used = new HashSet<>();
             for (Assignment assignment : statement.sets()) {
                 if (!used.add(Names.fold(assignment.column()))) {
@@ -1815,9 +2481,13 @@ final class Engine implements AutoCloseable {
                 if (schema.indexOf(assignment.column()) < 0) {
                     throw new SeaException("column not found: " + assignment.column());
                 }
+                if (schema.column(assignment.column()).generated != null) {
+                    throw new SeaException("cannot update generated column: " + assignment.column());
+                }
             }
             Evaluator evaluator = evaluator(table, null);
             List<StoredRow> matched = match(table, evaluator, statement.where());
+            lockRows(table, matched);
             Map<Long, Cell[]> replacements = new LinkedHashMap<>();
             List<Object[]> before = new ArrayList<>();
             List<Object[]> after = new ArrayList<>();
@@ -1843,6 +2513,8 @@ final class Engine implements AutoCloseable {
                 if (routines) {
                     fireTriggers(table, "BEFORE", "UPDATE", old, neu);
                 }
+                applyGenerated(schema, neu);
+                enforceChecks(schema, neu);
                 Cell[] cells = row.copyCells();
                 for (int i = 0; i < neu.length; i++) {
                     if (sameValue(old[i], neu[i])) {
@@ -1876,6 +2548,9 @@ final class Engine implements AutoCloseable {
                     fireTriggers(table, "AFTER", "UPDATE", before.get(i), after.get(i));
                 }
             }
+            if (statement.returningAll() || statement.returning() != null) {
+                pendingWrite = writeResult(table, statement.returningAll(), statement.returning(), after, List.of(), matched.size());
+            }
             return matched.size();
             } finally {
                 if (ownDeletes) {
@@ -1889,15 +2564,21 @@ final class Engine implements AutoCloseable {
     }
 
     private int delete(Delete statement) {
-        rejectView(statement.table());
+        StoredView instead = findView(statement.table());
+        if (instead != null) {
+            return insteadDelete(statement, instead);
+        }
         return inSql(() -> mutating(statement.table(), () -> {
             guardMutation(statement.table(), "DELETE");
             TableStore table = require(statement.table());
             Evaluator evaluator = evaluator(table, null);
             List<StoredRow> matched = match(table, evaluator, statement.where());
+            lockRows(table, matched);
             List<Long> ids = new ArrayList<>();
+            List<Object[]> removed = new ArrayList<>();
             for (StoredRow row : matched) {
                 ids.add(row.id);
+                removed.add(logical(table, row));
             }
             if (Names.same(table.schema().name, SystemTables.USERS)) {
                 guardLastAdmin(table, ids, null);
@@ -1921,6 +2602,9 @@ final class Engine implements AutoCloseable {
                         count++;
                     }
                 }
+                if (statement.returningAll() || statement.returning() != null) {
+                    pendingWrite = writeResult(table, statement.returningAll(), statement.returning(), removed, List.of(), count);
+                }
                 return count;
             } finally {
                 if (ownDeletes) {
@@ -1930,6 +2614,146 @@ final class Engine implements AutoCloseable {
                     rewritingRows = null;
                 }
             }
+        }));
+    }
+
+    private int truncate(Truncate statement) {
+        rejectView(statement.table());
+        return inSql(() -> mutating(statement.table(), () -> {
+            guardMutation(statement.table(), "DELETE");
+            if ((actor == null || !actor.admin) && !owns(statement.table())) {
+                throw new SeaException("TRUNCATE requires the owner or a DBA");
+            }
+            TableStore table = require(statement.table());
+            String parentSchema = table.namespace();
+            for (TableStore other : tables.values()) {
+                if (other == table) {
+                    continue;
+                }
+                for (ForeignKey key : other.schema().foreignKeys) {
+                    if (!Names.same(key.referencedTable, table.schema().name)) {
+                        continue;
+                    }
+                    if (key.referencedSchema != null && !key.referencedSchema.isEmpty()
+                            && !Names.same(key.referencedSchema, parentSchema)) {
+                        continue;
+                    }
+                    for (StoredRow row : other.scan()) {
+                        for (int column : key.columns) {
+                            if (other.value(row, column) != null) {
+                                throw new SeaException("TRUNCATE blocked by child rows");
+                            }
+                        }
+                    }
+                }
+            }
+            return table.deleteAll();
+        }));
+    }
+
+    private int merge(Merge statement) {
+        rejectView(statement.target());
+        return inSql(() -> mutating(statement.target(), () -> {
+            guardMutation(statement.target(), "UPDATE");
+            if (statement.insertValues() != null) {
+                guardMutation(statement.target(), "INSERT");
+            }
+            TableStore target = require(statement.target());
+            SqlResult source = statement.sourceQuery() != null
+                    ? runQuery(statement.sourceQuery())
+                    : runQuery(new Select(false, true, List.of(), statement.source(), statement.sourceAlias(),
+                    List.of(), null, List.of(), null, List.of(), null, null));
+            Schema targetSchema = target.schema();
+            List<Column> sourceColumns = new ArrayList<>();
+            for (ColumnMeta meta : source.columns()) {
+                int length = meta.type() == DataType.CHAR || meta.type() == DataType.VARCHAR ? 256 : 0;
+                sourceColumns.add(new Column(meta.name(), meta.type(), length, 0, false, false, 0, false, null));
+            }
+            String sourceName = statement.sourceAlias() != null ? statement.sourceAlias()
+                    : statement.source() == null ? "source" : Relation.parse(statement.source()).name();
+            Schema sourceSchema = new Schema(sourceName, sourceColumns, new int[0], List.of(), List.of());
+            Evaluator evaluator = evaluator(null, null);
+            evaluator.useFrames(List.of(
+                    new Evaluator.Frame(targetSchema, targetSchema.name, statement.target(), target.namespace(), statement.targetAlias(),
+                            0, targetSchema.columns.size()),
+                    new Evaluator.Frame(sourceSchema, sourceName, statement.source(), target.namespace(), statement.sourceAlias(),
+                            targetSchema.columns.size(), sourceColumns.size())));
+            List<Long> targetIds = new ArrayList<>();
+            for (StoredRow row : target.scan()) {
+                targetIds.add(row.id);
+            }
+            int count = 0;
+            boolean routines = !SystemTables.isSystem(targetSchema.name);
+            int width = targetSchema.columns.size();
+            for (Row sourceRow : source.rows()) {
+                Object[] sourceValues = rowValues(sourceRow);
+                List<StoredRow> hits = new ArrayList<>();
+                for (Long id : targetIds) {
+                    StoredRow row = target.row(id);
+                    if (row == null) {
+                        continue;
+                    }
+                    Object[] joined = new Object[width + sourceValues.length];
+                    Object[] current = logical(target, row);
+                    System.arraycopy(current, 0, joined, 0, width);
+                    System.arraycopy(sourceValues, 0, joined, width, sourceValues.length);
+                    evaluator.bindJoined(joined);
+                    if (evaluator.truth(statement.on())) {
+                        hits.add(row);
+                    }
+                }
+                if (hits.size() > 1) {
+                    throw new SeaException("MERGE matched more than one target row");
+                }
+                if (hits.size() == 1 && statement.sets() != null) {
+                    StoredRow row = hits.get(0);
+                    Object[] old = logical(target, row);
+                    Object[] joined = new Object[width + sourceValues.length];
+                    System.arraycopy(old, 0, joined, 0, width);
+                    System.arraycopy(sourceValues, 0, joined, width, sourceValues.length);
+                    evaluator.bindJoined(joined);
+                    if (statement.matchedWhen() != null && !evaluator.truth(statement.matchedWhen())) {
+                        continue;
+                    }
+                    Object[] neu = old.clone();
+                    for (Assignment assignment : statement.sets()) {
+                        int index = targetSchema.indexOf(assignment.column());
+                        if (index < 0) {
+                            throw new SeaException("column not found: " + assignment.column());
+                        }
+                        neu[index] = prepared(targetSchema, targetSchema.columns.get(index), evaluator.eval(assignment.expr()));
+                    }
+                    if (routines) {
+                        fireTriggers(target, "BEFORE", "UPDATE", old, neu);
+                    }
+                    replaceRow(target, row, old, neu, routines);
+                    count++;
+                } else if (hits.isEmpty() && statement.insertValues() != null) {
+                    Object[] joined = new Object[width + sourceValues.length];
+                    System.arraycopy(sourceValues, 0, joined, width, sourceValues.length);
+                    evaluator.bindJoined(joined);
+                    if (statement.notMatchedWhen() != null && !evaluator.truth(statement.notMatchedWhen())) {
+                        continue;
+                    }
+                    Object[] raw = new Object[statement.insertValues().size()];
+                    for (int i = 0; i < raw.length; i++) {
+                        raw[i] = evaluator.eval(statement.insertValues().get(i));
+                    }
+                    List<String> columns = statement.insertColumns() == null ? List.of() : statement.insertColumns();
+                    Object[] values = place(targetSchema, columns, raw);
+                    if (routines) {
+                        fireTriggers(target, "BEFORE", "INSERT", null, values);
+                    }
+                    long id = target.insertOne(values);
+                    Object[] stored = logical(target, rowById(target, id));
+                    enforceOutgoing(target, stored);
+                    if (routines) {
+                        fireTriggers(target, "AFTER", "INSERT", null, stored);
+                    }
+                    count++;
+                }
+            }
+            return count;
         }));
     }
 
@@ -1945,9 +2769,14 @@ final class Engine implements AutoCloseable {
         }
         guardAccess(statement.table(), "SELECT");
         TableStore table = require(statement.table());
+        if (repeatable() && inTransaction && !SystemTables.isSystem(table.schema().name)) {
+            pinRead(table);
+        }
         Schema schema = table.schema();
-        List<SelectItem> items = statement.star() ? star(schema)
+        Set<String> allowed = columnScope(statement.table(), "SELECT");
+        List<SelectItem> items = statement.star() ? star(schema, allowed)
                 : expandStars(statement.items(), schema, schema.name, table.namespace(), statement.table(), statement.alias());
+        guardColumnUse(schema, allowed, items, statement.where());
         if (items.isEmpty()) {
             throw new SeaException("SELECT needs at least one expression");
         }
@@ -1964,7 +2793,12 @@ final class Engine implements AutoCloseable {
             throw new SeaException("cannot mix aggregates and columns without GROUP BY");
         }
         Evaluator evaluator = evaluator(table, statement.alias());
-        List<StoredRow> matched = match(table, evaluator, statement.where());
+        List<StoredRow> coveredRows = null;
+        if (statement.groupBy().isEmpty() && statement.having() == null) {
+            coveredRows = coverQuery(table, schema, items, statement.where(), evaluator);
+        }
+        final List<StoredRow> matched = coveredRows == null
+                ? match(table, evaluator, statement.where()) : coveredRows;
         List<ColumnMeta> columns = new ArrayList<>();
         for (SelectItem item : items) {
             columns.add(columnMeta(item, schema, table.namespace(), schema.name));
@@ -2001,6 +2835,9 @@ final class Engine implements AutoCloseable {
                 }
             });
         }
+        if (streamable(statement, aggregate, items)) {
+            return openStream(columns, matched, items, evaluator, statement.limit(), statement.offset());
+        }
         List<Projected> projected = new ArrayList<>();
         if (aggregate) {
             Object[] values = new Object[items.size()];
@@ -2017,6 +2854,7 @@ final class Engine implements AutoCloseable {
                 }
                 projected.add(new Projected(row, values, null));
             }
+            applyWindows(projected, items, statement.orderBy(), evaluator);
             if (statement.distinct()) {
                 projected = distinct(projected);
             }
@@ -2030,6 +2868,94 @@ final class Engine implements AutoCloseable {
             rows.add(new Row(columns, row.values));
         }
         return SqlResult.query(columns, rows);
+    }
+
+    private static final class PendingQuery {
+        private final List<ColumnMeta> columns;
+        private final List<StoredRow> matched;
+        private final List<SelectItem> items;
+        private final Evaluator evaluator;
+        private int at;
+        private final int end;
+
+        private PendingQuery(List<ColumnMeta> columns, List<StoredRow> matched, List<SelectItem> items,
+                             Evaluator evaluator, int at, int end) {
+            this.columns = columns;
+            this.matched = matched;
+            this.items = items;
+            this.evaluator = evaluator;
+            this.at = at;
+            this.end = end;
+        }
+
+        private boolean done() {
+            return at >= end;
+        }
+
+        private int remaining() {
+            return Math.max(0, end - at);
+        }
+    }
+
+    private boolean streamable(Select statement, boolean aggregate, List<SelectItem> items) {
+        if (requestedFetch <= 0 || captureDepth != 1 || aggregate || statement.distinct() || !statement.orderBy().isEmpty()) {
+            return false;
+        }
+        for (SelectItem item : items) {
+            if (item.expr() instanceof WindowExpr) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private SqlResult openStream(List<ColumnMeta> columns, List<StoredRow> matched, List<SelectItem> items,
+                                 Evaluator evaluator, Long limit, Long offset) {
+        int start = offset == null ? 0 : Math.max(0, offset.intValue());
+        int end = limit == null ? matched.size() : Math.min(matched.size(), start + Math.max(0, limit.intValue()));
+        PendingQuery pending = new PendingQuery(columns, matched, items, evaluator, Math.min(start, matched.size()), Math.max(start, end));
+        SqlResult block = pull(pending, requestedFetch);
+        if (pending.done()) {
+            return block;
+        }
+        long id = ++nextCursor;
+        openCursors.computeIfAbsent(actor, key -> new HashMap<>()).put(id, pending);
+        return block.withCursor(id);
+    }
+
+    private SqlResult pull(PendingQuery pending, int count) {
+        int take = count <= 0 ? pending.remaining() : Math.min(count, pending.remaining());
+        List<Row> rows = new ArrayList<>(Math.max(take, 0));
+        for (int n = 0; n < take; n++) {
+            StoredRow source = pending.matched.get(pending.at++);
+            pending.evaluator.bind(source);
+            Object[] values = new Object[pending.items.size()];
+            for (int i = 0; i < pending.items.size(); i++) {
+                values[i] = materialize(pending.evaluator.eval(pending.items.get(i).expr()));
+            }
+            rows.add(new Row(pending.columns, values));
+        }
+        return SqlResult.query(pending.columns, rows);
+    }
+
+    SqlResult fetchCursor(Session session, long id, int count) {
+        java.util.Map<Long, PendingQuery> held = openCursors.get(session);
+        PendingQuery pending = held == null ? null : held.get(id);
+        if (pending == null) {
+            throw new SeaException("cursor is not open");
+        }
+        SqlResult block = pull(pending, count);
+        if (pending.done()) {
+            held.remove(id);
+            return block;
+        }
+        return block.withCursor(id);
+    }
+
+    private void closeCursors(Session session) {
+        if (session != null) {
+            openCursors.remove(session);
+        }
     }
 
     private SqlResult queryWithoutTable(Select statement) {
@@ -2143,7 +3069,9 @@ final class Engine implements AutoCloseable {
             cteDefining = new HashSet<>();
             SqlResult produced;
             try {
-                produced = query(preparedView(view));
+                produced = complexView(view.source())
+                        ? runQuery(SqlParser.parseViewQuery(view.source()))
+                        : query(preparedView(view));
             } finally {
                 actor = previous;
                 cteScope = savedScope;
@@ -2286,6 +3214,12 @@ final class Engine implements AutoCloseable {
     }
 
     private Object orderValue(Projected projected, OrderItem order, List<SelectItem> items, boolean distinct, Evaluator evaluator) {
+        if (order.expr() instanceof WindowExpr) {
+            Map<Expr, Object> side = orderWindows.get(projected);
+            if (side != null && side.containsKey(order.expr())) {
+                return side.get(order.expr());
+            }
+        }
         Integer index = selectIndex(order.expr(), items);
         if (index != null) {
             return projected.values[index];
@@ -2392,6 +3326,258 @@ final class Engine implements AutoCloseable {
         };
     }
 
+    private Object scalarSubquery(Query query, Evaluator outer) {
+        SqlResult result = subquery(query, outer);
+        if (result.columns().size() != 1) {
+            throw new SeaException("scalar subquery must return one column");
+        }
+        if (result.size() > 1) {
+            throw new SeaException("scalar subquery returned more than one row");
+        }
+        if (result.size() == 0) {
+            return null;
+        }
+        return result.rows().get(0).get(0);
+    }
+
+    private Object inSubquery(Expr expr, Query query, boolean negated, Evaluator outer) {
+        Object value = outer.eval(expr);
+        SqlResult result = subquery(query, outer);
+        if (result.columns().size() != 1) {
+            throw new SeaException("IN subquery must return one column");
+        }
+        boolean found = false;
+        boolean unknown = value == null;
+        for (Row row : result.rows()) {
+            Object item = row.get(0);
+            if (item == null || value == null) {
+                unknown = true;
+                continue;
+            }
+            if (Values.compare(value, item) == 0) {
+                found = true;
+            }
+        }
+        if (found) {
+            return !negated;
+        }
+        if (unknown) {
+            return null;
+        }
+        return negated;
+    }
+
+    private Object existsSubquery(Query query, Evaluator outer) {
+        SqlResult result = subquery(query, outer);
+        return !result.rows().isEmpty();
+    }
+
+    private SqlResult subquery(Query query, Evaluator outer) {
+        if (++subqueryDepth > 32) {
+            subqueryDepth--;
+            throw new SeaException("subquery exceeded 32 nested levels");
+        }
+        Evaluator previous = correlation;
+        outer.link = previous;
+        correlation = outer;
+        try {
+            return runQuery(correlate(query));
+        } finally {
+            outer.link = null;
+            correlation = previous;
+            subqueryDepth--;
+        }
+    }
+
+    private Query correlate(Query query) {
+        return switch (query) {
+            case Select select -> correlateSelect(select);
+            case SelectProcedure procedure -> correlateProcedure(procedure);
+            case UnionQuery union -> new UnionQuery(correlate(union.left()), union.op(), union.all(), correlate(union.right()),
+                    union.orderBy(), union.limit(), union.offset());
+            case WithQuery with -> new WithQuery(correlateCtes(with.ctes()), correlate(with.body()));
+        };
+    }
+
+    private List<Cte> correlateCtes(List<Cte> ctes) {
+        List<Cte> copy = new ArrayList<>();
+        for (Cte cte : ctes) {
+            copy.add(new Cte(cte.name(), cte.columns(), correlate(cte.query())));
+        }
+        return copy;
+    }
+
+    private Select correlateSelect(Select select) {
+        return new Select(select.distinct(), select.star(), correlateItems(select.items(), select),
+                select.table(), select.alias(), correlateJoins(select.joins(), select),
+                correlateExpr(select.where(), select), correlateList(select.groupBy(), select),
+                correlateExpr(select.having(), select), correlateOrder(select.orderBy(), select),
+                select.limit(), select.offset());
+    }
+
+    private SelectProcedure correlateProcedure(SelectProcedure procedure) {
+        List<Expr> arguments = new ArrayList<>();
+        for (Expr argument : procedure.arguments()) {
+            arguments.add(correlateExpr(argument, procedure));
+        }
+        return new SelectProcedure(procedure.distinct(), procedure.star(), correlateItems(procedure.items(), procedure),
+                procedure.procedure(), arguments, procedure.alias(), correlateExpr(procedure.where(), procedure),
+                correlateList(procedure.groupBy(), procedure), correlateExpr(procedure.having(), procedure),
+                correlateOrder(procedure.orderBy(), procedure), procedure.limit(), procedure.offset());
+    }
+
+    private List<Join> correlateJoins(List<Join> joins, Query owner) {
+        List<Join> copy = new ArrayList<>();
+        for (Join join : joins) {
+            copy.add(new Join(join.kind(), join.relation(), join.alias(), correlateExpr(join.on(), owner),
+                    join.natural(), join.using()));
+        }
+        return copy;
+    }
+
+    private List<SelectItem> correlateItems(List<SelectItem> items, Query owner) {
+        List<SelectItem> copy = new ArrayList<>();
+        for (SelectItem item : items) {
+            copy.add(new SelectItem(correlateExpr(item.expr(), owner), item.alias(), item.label()));
+        }
+        return copy;
+    }
+
+    private List<Expr> correlateList(List<Expr> expressions, Query owner) {
+        List<Expr> copy = new ArrayList<>();
+        for (Expr expr : expressions) {
+            copy.add(correlateExpr(expr, owner));
+        }
+        return copy;
+    }
+
+    private List<OrderItem> correlateOrder(List<OrderItem> order, Query owner) {
+        List<OrderItem> copy = new ArrayList<>();
+        for (OrderItem item : order) {
+            copy.add(new OrderItem(correlateExpr(item.expr(), owner), item.descending()));
+        }
+        return copy;
+    }
+
+    private Expr correlateExpr(Expr expr, Query owner) {
+        if (expr == null) {
+            return null;
+        }
+        return switch (expr) {
+            case ColumnRef column -> correlateColumn(column, owner);
+            case Unary unary -> new Unary(unary.op(), correlateExpr(unary.expr(), owner));
+            case Binary binary -> new Binary(binary.op(), correlateExpr(binary.left(), owner), correlateExpr(binary.right(), owner));
+            case IsNull isNull -> new IsNull(correlateExpr(isNull.expr(), owner), isNull.negated());
+            case Like like -> new Like(correlateExpr(like.expr(), owner), correlateExpr(like.pattern(), owner),
+                    correlateExpr(like.escape(), owner), like.negated());
+            case InList inList -> new InList(correlateExpr(inList.expr(), owner), correlateList(inList.values(), owner), inList.negated());
+            case Between between -> new Between(correlateExpr(between.expr(), owner), correlateExpr(between.low(), owner),
+                    correlateExpr(between.high(), owner), between.negated());
+            case Call call -> new Call(call.name(), call.distinct(), call.star(), correlateList(call.args(), owner));
+            case CaseExpr caseExpr -> {
+                List<WhenBranch> branches = new ArrayList<>();
+                for (WhenBranch branch : caseExpr.branches()) {
+                    branches.add(new WhenBranch(correlateExpr(branch.when(), owner), correlateExpr(branch.then(), owner)));
+                }
+                yield new CaseExpr(correlateExpr(caseExpr.operand(), owner), branches, correlateExpr(caseExpr.otherwise(), owner));
+            }
+            case CastExpr cast -> new CastExpr(correlateExpr(cast.expr(), owner), cast.type(), cast.length(), cast.scale());
+            case InSubquery inSubquery -> new InSubquery(correlateExpr(inSubquery.expr(), owner), inSubquery.query(), inSubquery.negated());
+            case ScalarSubquery ignored -> expr;
+            case ExistsExpr ignored -> expr;
+            default -> expr;
+        };
+    }
+
+    private Expr correlateColumn(ColumnRef column, Query owner) {
+        if (innerColumn(owner, column)) {
+            return column;
+        }
+        for (Evaluator cursor = correlation; cursor != null; cursor = cursor.link) {
+            Object value = cursor.readOwned(column);
+            if (value != Values.MISSING) {
+                return new Literal(value);
+            }
+        }
+        return column;
+    }
+
+    private boolean innerColumn(Query owner, ColumnRef column) {
+        return switch (owner) {
+            case Select select -> innerSelect(select, column);
+            case SelectProcedure procedure -> column.qualifier() == null
+                    || (procedure.alias() != null && Names.same(procedure.alias(), column.qualifier()))
+                    || Names.same(procedure.procedure(), column.qualifier());
+            case UnionQuery union -> innerColumn(union.left(), column) || innerColumn(union.right(), column);
+            case WithQuery with -> innerColumn(with.body(), column);
+        };
+    }
+
+    private boolean innerSelect(Select select, ColumnRef column) {
+        if (column.qualifier() != null) {
+            if (matchesRelation(select.table(), select.alias(), column.qualifier())) {
+                return true;
+            }
+            for (Join join : select.joins()) {
+                if (matchesRelation(join.relation(), join.alias(), column.qualifier())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (relationHasColumn(select.table(), column.name())) {
+            return true;
+        }
+        for (Join join : select.joins()) {
+            if (relationHasColumn(join.relation(), column.name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesRelation(String relation, String alias, String qualifier) {
+        if (alias != null && Names.same(alias, qualifier)) {
+            return true;
+        }
+        if (relation == null) {
+            return false;
+        }
+        if (Names.same(relation, qualifier)) {
+            return true;
+        }
+        return Names.same(Relation.parse(relation).name(), qualifier);
+    }
+
+    private boolean relationHasColumn(String relation, String column) {
+        if (relation == null || column == null) {
+            return false;
+        }
+        if (activeCte(relation)) {
+            Held held = cteScope.get(Names.fold(Relation.parse(relation).name()));
+            if (held == null) {
+                return false;
+            }
+            for (Evaluator.Frame frame : held.frames()) {
+                if (frame.schema.indexOf(column) >= 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        StoredView view = findView(relation);
+        if (view != null) {
+            for (String name : view.columns()) {
+                if (Names.same(name, column)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        TableStore table = findTable(relation);
+        return table != null && table.schema().indexOf(column) >= 0;
+    }
+
     private SqlResult queryWith(WithQuery with) {
         Map<String, Held> saved = cteScope;
         Map<String, Held> scope = new LinkedHashMap<>();
@@ -2438,22 +3624,20 @@ final class Engine implements AutoCloseable {
     private SqlResult queryUnion(UnionQuery union) {
         SqlResult left = runQuery(union.left());
         SqlResult right = runQuery(union.right());
+        String op = union.op().name();
         if (left.columns().size() != right.columns().size()) {
-            throw new SeaException("UNION column count does not match");
+            throw new SeaException(op + " column count does not match");
         }
         for (int i = 0; i < left.columns().size(); i++) {
             if (left.columns().get(i).type() != right.columns().get(i).type()) {
-                throw new SeaException("UNION column types do not match");
+                throw new SeaException(op + " column types do not match");
             }
         }
         List<SelectItem> items = new ArrayList<>();
         for (ColumnMeta column : left.columns()) {
             items.add(new SelectItem(new ColumnRef(null, column.name()), null, column.name()));
         }
-        List<Projected> projected = new ArrayList<>();
-        Set<IndexKey> seen = new HashSet<>();
-        addUnion(projected, left, seen, union.all());
-        addUnion(projected, right, seen, union.all());
+        List<Projected> projected = combineSets(left, right, union.op(), union.all());
         if (!union.orderBy().isEmpty()) {
             sortUnion(projected, union.orderBy(), items);
         }
@@ -2463,6 +3647,64 @@ final class Engine implements AutoCloseable {
             rows.add(new Row(left.columns(), row.values));
         }
         return SqlResult.query(left.columns(), rows);
+    }
+
+    private List<Projected> combineSets(SqlResult left, SqlResult right, SetOp op, boolean all) {
+        List<Projected> projected = new ArrayList<>();
+        if (op == SetOp.UNION) {
+            Set<IndexKey> seen = new HashSet<>();
+            addUnion(projected, left, seen, all);
+            addUnion(projected, right, seen, all);
+            return projected;
+        }
+        Map<IndexKey, Integer> rightCounts = new LinkedHashMap<>();
+        for (Row row : right.rows()) {
+            IndexKey key = new IndexKey(rowValues(row));
+            rightCounts.merge(key, 1, Integer::sum);
+        }
+        Set<IndexKey> seen = new HashSet<>();
+        List<Object[]> leftOrder = new ArrayList<>();
+        for (Row row : left.rows()) {
+            leftOrder.add(rowValues(row));
+        }
+        if (op == SetOp.EXCEPT) {
+            for (Object[] values : leftOrder) {
+                IndexKey key = new IndexKey(values);
+                int have = rightCounts.getOrDefault(key, 0);
+                if (all) {
+                    if (have > 0) {
+                        rightCounts.put(key, have - 1);
+                        continue;
+                    }
+                    projected.add(new Projected(null, values, null));
+                } else if (have == 0 && seen.add(key)) {
+                    projected.add(new Projected(null, values, null));
+                }
+            }
+            return projected;
+        }
+        for (Object[] values : leftOrder) {
+            IndexKey key = new IndexKey(values);
+            int have = rightCounts.getOrDefault(key, 0);
+            if (have <= 0) {
+                continue;
+            }
+            if (all) {
+                rightCounts.put(key, have - 1);
+                projected.add(new Projected(null, values, null));
+            } else if (seen.add(key)) {
+                projected.add(new Projected(null, values, null));
+            }
+        }
+        return projected;
+    }
+
+    private static Object[] rowValues(Row row) {
+        Object[] values = new Object[row.size()];
+        for (int i = 0; i < values.length; i++) {
+            values[i] = row.get(i);
+        }
+        return values;
     }
 
     private void addUnion(List<Projected> projected, SqlResult result, Set<IndexKey> seen, boolean all) {
@@ -2512,13 +3754,20 @@ final class Engine implements AutoCloseable {
         List<Expr> whereParts = conjuncts(statement.where());
         Probe left = openProbe(statement.table(), statement.alias());
         Held current = null;
+        List<Evaluator.Frame> leftFrames = left.frames();
+        joinKeys = new HashSet<>();
         for (Join join : statement.joins()) {
             Probe right = openProbe(join.relation(), join.alias());
+            if (join.on() == null && (join.natural() || !join.using().isEmpty())) {
+                Expr on = equiJoin(leftFrames, right.frames(), join.using(), joinKeys);
+                join = new Join(join.kind(), join.relation(), join.alias(), on, join.natural(), join.using());
+            }
             if (join.kind() == JoinKind.RIGHT) {
                 Probe inner = current == null ? left : new Probe(current.frames(), current.rows(), null, null);
                 Held driving = materialize(right, filtersOn(whereParts, right.frames()));
                 Held joined = joinInputs(driving, inner, join.on(), List.of(), true, false);
                 current = flip(joined, inner.frames(), right.frames());
+                leftFrames = current.frames();
                 continue;
             }
             if (current == null) {
@@ -2529,16 +3778,60 @@ final class Engine implements AutoCloseable {
             if (join.kind() == JoinKind.CROSS) {
                 Held rightRows = materialize(right, filtersOn(whereParts, right.frames()));
                 current = joinRows(current, rightRows, null, false);
+                leftFrames = current.frames();
                 continue;
             }
             boolean full = join.kind() == JoinKind.FULL;
             boolean outer = full || join.kind() == JoinKind.LEFT;
             current = joinInputs(current, right, join.on(), outer ? List.of() : whereParts, outer, full);
+            leftFrames = current.frames();
         }
         if (current == null) {
             current = materialize(left, filtersOn(whereParts, left.frames()));
         }
-        return projectHeld(statement, current);
+        try {
+            return projectHeld(statement, current);
+        } finally {
+            joinKeys = Set.of();
+        }
+    }
+
+    private Expr equiJoin(List<Evaluator.Frame> left, List<Evaluator.Frame> right, List<String> using, Set<String> shared) {
+        List<String> wanted = using == null ? List.of() : using;
+        Expr on = null;
+        Set<String> matched = new HashSet<>();
+        for (Evaluator.Frame rightFrame : right) {
+            for (Column column : rightFrame.schema.columns) {
+                if (!wanted.isEmpty() && wanted.stream().noneMatch(name -> Names.same(name, column.name))) {
+                    continue;
+                }
+                Evaluator.Frame owner = null;
+                for (Evaluator.Frame frame : left) {
+                    if (frame.schema.indexOf(column.name) >= 0) {
+                        owner = frame;
+                        break;
+                    }
+                }
+                if (owner == null) {
+                    continue;
+                }
+                matched.add(Names.fold(column.name));
+                shared.add(Names.fold(column.name));
+                String leftName = owner.alias != null ? owner.alias : owner.name;
+                String rightName = rightFrame.alias != null ? rightFrame.alias : rightFrame.name;
+                Expr eq = new Binary(BinaryOp.EQ, new ColumnRef(leftName, column.name), new ColumnRef(rightName, column.name));
+                on = on == null ? eq : new Binary(BinaryOp.AND, on, eq);
+            }
+        }
+        for (String name : wanted) {
+            if (!matched.contains(Names.fold(name))) {
+                throw new SeaException("USING column is not shared: " + name);
+            }
+        }
+        if (on == null) {
+            throw new SeaException("JOIN has no common column");
+        }
+        return on;
     }
 
     private SqlResult projectHeld(Select statement, Held held) {
@@ -2554,10 +3847,15 @@ final class Engine implements AutoCloseable {
         List<SelectItem> items = new ArrayList<>();
         List<ColumnMeta> columns = new ArrayList<>();
         if (statement.star()) {
+            Set<String> emittedKeys = new HashSet<>();
             for (Evaluator.Frame frame : held.frames()) {
                 String qualifier = frame.alias != null ? frame.alias : frame.name;
                 String namespace = frame.namespace == null ? "" : frame.namespace;
                 for (Column column : frame.schema.columns) {
+                    String key = Names.fold(column.name);
+                    if (joinKeys.contains(key) && !emittedKeys.add(key)) {
+                        continue;
+                    }
                     items.add(new SelectItem(new ColumnRef(qualifier, column.name), null, column.name));
                     columns.add(new ColumnMeta(column.name, column.type, namespace, frame.name));
                 }
@@ -2636,6 +3934,7 @@ final class Engine implements AutoCloseable {
             }
             projected.add(new Projected(null, values, row));
         }
+        applyWindows(projected, items, statement.orderBy(), evaluator);
         if (statement.distinct()) {
             projected = distinct(projected);
         }
@@ -2671,6 +3970,9 @@ final class Engine implements AutoCloseable {
         }
         guardAccess(written, "SELECT");
         TableStore table = require(written);
+        if (repeatable() && inTransaction && !SystemTables.isSystem(table.schema().name)) {
+            pinRead(table);
+        }
         Schema schema = table.schema();
         Evaluator.Frame frame = new Evaluator.Frame(schema, schema.name, written, table.namespace(), alias, 0, schema.columns.size());
         return new Probe(List.of(frame), null, table, alias);
@@ -3314,6 +4616,7 @@ final class Engine implements AutoCloseable {
                 projected.add(source.projected(members.get(0), values));
             }
         }
+        applyWindows(projected, items, orderBy, evaluator);
         if (distinct) {
             projected = distinct(projected);
         }
@@ -3408,6 +4711,35 @@ final class Engine implements AutoCloseable {
                 checkGrouped(between.low(), keys, source);
                 checkGrouped(between.high(), keys, source);
             }
+            case CaseExpr caseExpr -> {
+                if (caseExpr.operand() != null) {
+                    checkGrouped(caseExpr.operand(), keys, source);
+                }
+                for (WhenBranch branch : caseExpr.branches()) {
+                    checkGrouped(branch.when(), keys, source);
+                    checkGrouped(branch.then(), keys, source);
+                }
+                if (caseExpr.otherwise() != null) {
+                    checkGrouped(caseExpr.otherwise(), keys, source);
+                }
+            }
+            case WindowExpr window -> {
+                for (Expr arg : window.call().args()) {
+                    checkGrouped(arg, keys, source);
+                }
+                for (Expr part : window.partition()) {
+                    checkGrouped(part, keys, source);
+                }
+                for (OrderItem item : window.orderBy()) {
+                    checkGrouped(item.expr(), keys, source);
+                }
+            }
+            case CastExpr cast -> checkGrouped(cast.expr(), keys, source);
+            case InSubquery inSubquery -> checkGrouped(inSubquery.expr(), keys, source);
+            case ScalarSubquery ignored -> {
+            }
+            case ExistsExpr ignored -> {
+            }
             default -> {
             }
         }
@@ -3463,20 +4795,126 @@ final class Engine implements AutoCloseable {
         return schema.name + ":" + index;
     }
 
+    private List<StoredRow> coverQuery(TableStore table, Schema schema, List<SelectItem> items, Expr where,
+                                       Evaluator evaluator) {
+        if (where == null) {
+            return null;
+        }
+        Set<Integer> needed = new HashSet<>();
+        for (SelectItem item : items) {
+            if (!columnsOf(item.expr(), schema, needed)) {
+                return null;
+            }
+        }
+        if (!columnsOf(where, schema, needed) || needed.isEmpty()) {
+            return null;
+        }
+        EqualsProbe probe = probeEquals(schema, evaluator, where);
+        if (probe.contradiction || probe.orColumn != null || probe.rangeColumn != null || probe.likePrefix != null) {
+            return null;
+        }
+        return table.cover(probe.values, where, probe.calls, needed);
+    }
+
+    private boolean columnsOf(Expr expr, Schema schema, Set<Integer> needed) {
+        if (expr == null || expr instanceof Literal || expr instanceof Param) {
+            return true;
+        }
+        if (expr instanceof ColumnRef column) {
+            int index = schema.indexOf(column.name());
+            if (index < 0) {
+                return false;
+            }
+            needed.add(index);
+            return true;
+        }
+        if (expr instanceof Unary unary) {
+            return columnsOf(unary.expr(), schema, needed);
+        }
+        if (expr instanceof Binary binary) {
+            return columnsOf(binary.left(), schema, needed) && columnsOf(binary.right(), schema, needed);
+        }
+        if (expr instanceof IsNull isNull) {
+            return columnsOf(isNull.expr(), schema, needed);
+        }
+        if (expr instanceof Like like) {
+            return columnsOf(like.expr(), schema, needed) && columnsOf(like.pattern(), schema, needed)
+                    && columnsOf(like.escape(), schema, needed);
+        }
+        if (expr instanceof Between between) {
+            return columnsOf(between.expr(), schema, needed) && columnsOf(between.low(), schema, needed)
+                    && columnsOf(between.high(), schema, needed);
+        }
+        if (expr instanceof InList list) {
+            if (!columnsOf(list.expr(), schema, needed)) {
+                return false;
+            }
+            for (Expr value : list.values()) {
+                if (!columnsOf(value, schema, needed)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (expr instanceof Call call) {
+            for (Expr arg : call.args()) {
+                if (!columnsOf(arg, schema, needed)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (expr instanceof CastExpr cast) {
+            return columnsOf(cast.expr(), schema, needed);
+        }
+        return false;
+    }
+
     private List<StoredRow> match(TableStore table, Evaluator evaluator, Expr where) {
         List<StoredRow> matched = new ArrayList<>();
         Iterable<StoredRow> source = table.scan();
-        if (where != null) {
+        TableStore.Snapshot pinned = pinnedRead(table);
+        TableStore.Snapshot dirty = pinned == null ? uncommitted(table) : null;
+        if (pinned != null) {
+            source = pinned.rows.values();
+        } else if (dirty != null) {
+            source = dirty.rows.values();
+        } else if (where != null) {
             EqualsProbe probe = probeEquals(table.schema(), evaluator, where);
             if (probe.contradiction) {
                 return matched;
             }
-            List<StoredRow> indexed = table.lookup(probe.values);
+            List<StoredRow> indexed = null;
+            if (probe.orColumn != null) {
+                indexed = new ArrayList<>();
+                Set<Long> seen = new HashSet<>();
+                for (Object value : probe.orValues) {
+                    Map<Integer, Object> one = new LinkedHashMap<>();
+                    one.put(probe.orColumn, value);
+                    List<StoredRow> part = table.lookup(one, where, probe.calls);
+                    if (part == null) {
+                        indexed = null;
+                        break;
+                    }
+                    for (StoredRow row : part) {
+                        if (seen.add(row.id)) {
+                            indexed.add(row);
+                        }
+                    }
+                }
+            } else if (probe.rangeColumn != null) {
+                indexed = table.lookupRange(probe.values, probe.rangeColumn, probe.low, probe.lowInclusive,
+                        probe.high, probe.highInclusive, probe.likePrefix, where, probe.calls, statistics(table));
+            }
+            if (indexed == null) {
+                indexed = table.lookup(probe.values, where, probe.calls);
+            }
             if (indexed != null) {
                 source = indexed;
             }
         }
         for (StoredRow row : source) {
+            Pace.check();
             evaluator.bind(row);
             if (where == null || evaluator.truth(where)) {
                 matched.add(row);
@@ -3487,8 +4925,75 @@ final class Engine implements AutoCloseable {
 
     private EqualsProbe probeEquals(Schema schema, Evaluator evaluator, Expr where) {
         EqualsProbe probe = new EqualsProbe();
+        if (where instanceof Binary binary && binary.op() == BinaryOp.OR && collectOr(schema, evaluator, where, probe)) {
+            return probe;
+        }
         collectEquals(schema, evaluator, where, probe);
         return probe;
+    }
+
+    private boolean collectOr(Schema schema, Evaluator evaluator, Expr expr, EqualsProbe probe) {
+        List<Binary> terms = new ArrayList<>();
+        if (!flattenOr(expr, terms)) {
+            return false;
+        }
+        Integer column = null;
+        List<Object> values = new ArrayList<>();
+        for (Binary term : terms) {
+            if (term.op() != BinaryOp.EQ) {
+                return false;
+            }
+            ColumnRef ref;
+            Expr valueExpr;
+            if (term.left() instanceof ColumnRef left && constant(term.right()) != Values.MISSING) {
+                ref = left;
+                valueExpr = term.right();
+            } else if (term.right() instanceof ColumnRef right && constant(term.left()) != Values.MISSING) {
+                ref = right;
+                valueExpr = term.left();
+            } else {
+                return false;
+            }
+            if (!evaluator.owns(ref)) {
+                return false;
+            }
+            int index = schema.indexOf(ref.name());
+            if (index < 0) {
+                return false;
+            }
+            if (column == null) {
+                column = index;
+            } else if (column != index) {
+                return false;
+            }
+            Object raw = constant(valueExpr);
+            if (raw == null) {
+                continue;
+            }
+            try {
+                values.add(Values.coerce(schema.columns.get(index).type, schema.columns.get(index).length,
+                        schema.columns.get(index).scale, raw));
+            } catch (SeaException exception) {
+                return false;
+            }
+        }
+        if (column == null || values.isEmpty()) {
+            return false;
+        }
+        probe.orColumn = column;
+        probe.orValues = values;
+        return true;
+    }
+
+    private boolean flattenOr(Expr expr, List<Binary> terms) {
+        if (!(expr instanceof Binary binary)) {
+            return false;
+        }
+        if (binary.op() == BinaryOp.OR) {
+            return flattenOr(binary.left(), terms) && flattenOr(binary.right(), terms);
+        }
+        terms.add(binary);
+        return true;
     }
 
     private void collectEquals(Schema schema, Evaluator evaluator, Expr expr, EqualsProbe probe) {
@@ -3500,11 +5005,30 @@ final class Engine implements AutoCloseable {
             collectEquals(schema, evaluator, binary.right(), probe);
             return;
         }
+        if (expr instanceof Between between && !between.negated()) {
+            noteBetween(schema, evaluator, between, probe);
+            return;
+        }
+        if (expr instanceof Like like && !like.negated()) {
+            noteLike(schema, evaluator, like, probe);
+            return;
+        }
         if (!(expr instanceof Binary binary) || binary.op() != BinaryOp.EQ) {
+            if (expr instanceof Binary comparison) {
+                noteRange(schema, evaluator, comparison, probe);
+            }
             return;
         }
         ColumnRef column;
         Expr valueExpr;
+        if (binary.left() instanceof Call call && constant(binary.right()) != Values.MISSING) {
+            noteCall(call, constant(binary.right()), probe);
+            return;
+        }
+        if (binary.right() instanceof Call call && constant(binary.left()) != Values.MISSING) {
+            noteCall(call, constant(binary.left()), probe);
+            return;
+        }
         if (binary.left() instanceof ColumnRef left && constant(binary.right()) != Values.MISSING) {
             column = left;
             valueExpr = binary.right();
@@ -3550,6 +5074,112 @@ final class Engine implements AutoCloseable {
         probe.values.put(index, coerced);
     }
 
+    private void noteCall(Call call, Object raw, EqualsProbe probe) {
+        String key = IndexFeatures.canonical(call);
+        if (key == null || raw == null) {
+            return;
+        }
+        probe.calls.put(key, raw);
+    }
+
+    private void noteRange(Schema schema, Evaluator evaluator, Binary binary, EqualsProbe probe) {
+        boolean lower = binary.op() == BinaryOp.GT || binary.op() == BinaryOp.GE;
+        boolean upper = binary.op() == BinaryOp.LT || binary.op() == BinaryOp.LE;
+        if (!lower && !upper) {
+            return;
+        }
+        ColumnRef column;
+        Expr bound;
+        if (binary.left() instanceof ColumnRef left && constant(binary.right()) != Values.MISSING) {
+            column = left;
+            bound = binary.right();
+        } else {
+            return;
+        }
+        int index = rangeColumn(schema, evaluator, column);
+        if (index < 0 || probe.values.containsKey(index)) {
+            return;
+        }
+        Object value = coercedConstant(schema, index, constant(bound));
+        if (value == null) {
+            return;
+        }
+        if (probe.rangeColumn != null && probe.rangeColumn != index) {
+            return;
+        }
+        probe.rangeColumn = index;
+        if (lower) {
+            probe.low = value;
+            probe.lowInclusive = binary.op() == BinaryOp.GE;
+        } else {
+            probe.high = value;
+            probe.highInclusive = binary.op() == BinaryOp.LE;
+        }
+    }
+
+    private void noteBetween(Schema schema, Evaluator evaluator, Between between, EqualsProbe probe) {
+        if (!(between.expr() instanceof ColumnRef column)) {
+            return;
+        }
+        int index = rangeColumn(schema, evaluator, column);
+        if (index < 0 || probe.rangeColumn != null || probe.values.containsKey(index)) {
+            return;
+        }
+        Object low = coercedConstant(schema, index, constant(between.low()));
+        Object high = coercedConstant(schema, index, constant(between.high()));
+        if (low == null || high == null) {
+            return;
+        }
+        probe.rangeColumn = index;
+        probe.low = low;
+        probe.high = high;
+        probe.lowInclusive = true;
+        probe.highInclusive = true;
+    }
+
+    private void noteLike(Schema schema, Evaluator evaluator, Like like, EqualsProbe probe) {
+        if (like.escape() != null || !(like.expr() instanceof ColumnRef column)) {
+            return;
+        }
+        Object pattern = constant(like.pattern());
+        if (!(pattern instanceof String text) || text.length() < 2 || !text.endsWith("%")) {
+            return;
+        }
+        String prefix = text.substring(0, text.length() - 1);
+        if (prefix.indexOf('%') >= 0 || prefix.indexOf('_') >= 0) {
+            return;
+        }
+        int index = rangeColumn(schema, evaluator, column);
+        if (index < 0 || probe.rangeColumn != null || probe.values.containsKey(index)) {
+            return;
+        }
+        DataType type = schema.columns.get(index).type;
+        if (type != DataType.CHAR && type != DataType.VARCHAR) {
+            return;
+        }
+        probe.rangeColumn = index;
+        probe.likePrefix = prefix;
+    }
+
+    private int rangeColumn(Schema schema, Evaluator evaluator, ColumnRef column) {
+        if (!evaluator.owns(column)) {
+            return -1;
+        }
+        return schema.indexOf(column.name());
+    }
+
+    private Object coercedConstant(Schema schema, int index, Object raw) {
+        if (raw == null || raw == Values.MISSING) {
+            return null;
+        }
+        Column column = schema.columns.get(index);
+        try {
+            return Values.coerce(column.type, column.length, column.scale, raw);
+        } catch (SeaException exception) {
+            return null;
+        }
+    }
+
     private Object constant(Expr expr) {
         if (expr instanceof Literal literal) {
             return literal.value();
@@ -3561,8 +5191,15 @@ final class Engine implements AutoCloseable {
     }
 
     private List<SelectItem> star(Schema schema) {
+        return star(schema, null);
+    }
+
+    private List<SelectItem> star(Schema schema, Set<String> allowed) {
         List<SelectItem> items = new ArrayList<>();
         for (Column column : schema.columns) {
+            if (allowed != null && !allowed.contains(Names.fold(column.name))) {
+                continue;
+            }
             items.add(new SelectItem(new ColumnRef(null, column.name), null, column.name));
         }
         return items;
@@ -3642,12 +5279,13 @@ final class Engine implements AutoCloseable {
             case NextValue ignored -> DataType.BIGINT;
             case ContextRef context -> contextType(context);
             case Call call when Evaluator.aggregate(call.name()) -> aggregateType(call, schema);
-            case Call call when call.name().equalsIgnoreCase("LENGTH") || call.name().equalsIgnoreCase("CHAR_LENGTH") -> DataType.BIGINT;
-            case Call call when call.name().equalsIgnoreCase("LOWER") || call.name().equalsIgnoreCase("UPPER") -> DataType.VARCHAR;
-            case Call call when call.name().equalsIgnoreCase("GEN_ID") -> DataType.BIGINT;
-            case Call call when call.name().equalsIgnoreCase("COALESCE") -> call.args().isEmpty()
-                    ? DataType.VARCHAR : infer(call.args().get(0), schema);
-            case Call ignored -> DataType.VARCHAR;
+            case Call call -> scalarType(call, schema);
+            case WindowExpr window -> windowType(window, schema);
+            case CaseExpr caseExpr -> caseType(caseExpr, schema);
+            case CastExpr cast -> cast.type();
+            case ScalarSubquery subquery -> subqueryType(subquery.query(), schema);
+            case InSubquery ignored -> DataType.BOOLEAN;
+            case ExistsExpr ignored -> DataType.BOOLEAN;
             case IsNull ignored -> DataType.BOOLEAN;
             case Like ignored -> DataType.BOOLEAN;
             case InList ignored -> DataType.BOOLEAN;
@@ -3661,6 +5299,80 @@ final class Engine implements AutoCloseable {
             case Binary binary when binary.op() == BinaryOp.CONCAT -> DataType.VARCHAR;
             case Binary binary -> wider(infer(binary.left(), schema), infer(binary.right(), schema));
         };
+    }
+
+    private DataType scalarType(Call call, Schema schema) {
+        String name = call.name().toUpperCase(java.util.Locale.ROOT);
+        return switch (name) {
+            case "LENGTH", "CHAR_LENGTH", "POSITION", "DATEDIFF", "GEN_ID" -> DataType.BIGINT;
+            case "JSON_EXTRACT", "JSON_TYPE" -> DataType.VARCHAR;
+            case "EXTRACT", "SIGN" -> DataType.INTEGER;
+            case "LOWER", "UPPER", "SUBSTRING", "TRIM", "LTRIM", "RTRIM", "REPLACE" -> DataType.VARCHAR;
+            case "COALESCE" -> call.args().isEmpty() ? DataType.VARCHAR : infer(call.args().get(0), schema);
+            case "ABS", "CEIL", "CEILING", "FLOOR", "ROUND" -> call.args().isEmpty()
+                    ? DataType.INTEGER : infer(call.args().get(0), schema);
+            case "MOD" -> call.args().size() < 2
+                    ? DataType.INTEGER : wider(infer(call.args().get(0), schema), infer(call.args().get(1), schema));
+            case "DATEADD" -> call.args().size() < 3 ? DataType.TIMESTAMP : dateAddType(call, schema);
+            default -> DataType.VARCHAR;
+        };
+    }
+
+    private DataType dateAddType(Call call, Schema schema) {
+        DataType base = infer(call.args().get(2), schema);
+        if (!(call.args().get(0) instanceof Literal literal) || !(literal.value() instanceof String part)) {
+            return base;
+        }
+        String folded = part.toUpperCase(java.util.Locale.ROOT);
+        if (base == DataType.DATE && (folded.equals("HOUR") || folded.equals("MINUTE") || folded.equals("SECOND"))) {
+            return DataType.TIMESTAMP;
+        }
+        return base;
+    }
+
+    private DataType subqueryType(Query query, Schema schema) {
+        return switch (query) {
+            case Select select when select.star() && select.table() != null -> {
+                TableStore table = findTable(select.table());
+                yield table == null || table.schema().columns.isEmpty()
+                        ? DataType.VARCHAR : table.schema().columns.get(0).type;
+            }
+            case Select select when !select.items().isEmpty() -> {
+                Expr expr = select.items().get(0).expr();
+                if (expr instanceof ColumnRef column && select.table() != null) {
+                    TableStore table = findTable(select.table());
+                    if (table != null && table.schema().indexOf(column.name()) >= 0) {
+                        yield table.schema().column(column.name()).type;
+                    }
+                }
+                yield expr instanceof ColumnRef ? DataType.VARCHAR : infer(expr, schema);
+            }
+            case UnionQuery union -> subqueryType(union.left(), schema);
+            case WithQuery with -> subqueryType(with.body(), schema);
+            default -> DataType.VARCHAR;
+        };
+    }
+
+    private DataType caseType(CaseExpr expr, Schema schema) {
+        DataType found = null;
+        for (WhenBranch branch : expr.branches()) {
+            found = sameBranch(found, branch.then(), schema);
+        }
+        if (expr.otherwise() != null) {
+            found = sameBranch(found, expr.otherwise(), schema);
+        }
+        return found == null ? DataType.VARCHAR : found;
+    }
+
+    private DataType sameBranch(DataType found, Expr expr, Schema schema) {
+        if (expr instanceof Literal literal && literal.value() == null) {
+            return found;
+        }
+        DataType type = infer(expr, schema);
+        if (found == null || found == type) {
+            return type;
+        }
+        throw new SeaException("CASE branch types do not match");
     }
 
     private DataType aggregateType(Call call, Schema schema) {
@@ -3742,6 +5454,15 @@ final class Engine implements AutoCloseable {
         if (value instanceof LocalDateTime) {
             return DataType.TIMESTAMP;
         }
+        if (value instanceof java.util.UUID) {
+            return DataType.UUID;
+        }
+        if (value instanceof SqlInterval) {
+            return DataType.INTERVAL;
+        }
+        if (value instanceof java.time.OffsetDateTime) {
+            return DataType.TIMESTAMPTZ;
+        }
         if (value instanceof String) {
             return DataType.VARCHAR;
         }
@@ -3764,8 +5485,12 @@ final class Engine implements AutoCloseable {
 
     private int mutating(String tableName, java.util.function.IntSupplier action) {
         TableStore table = require(tableName);
+        if (actor != null && actor.isolation == 1 && !SystemTables.isSystem(table.schema().name)) {
+            rejectBorrowed(table);
+        }
         track(table);
         boolean boundary = statementDepth == 0 && procedureDepth == 0;
+        int renameBase = renameUndo.size();
         if (boundary) {
             statementSnapshots = new IdentityHashMap<>();
         }
@@ -3782,12 +5507,16 @@ final class Engine implements AutoCloseable {
         } catch (RuntimeException exception) {
             if (boundary) {
                 restoreStatement();
+                undoRenames(renameBase);
             }
             throw exception;
         } finally {
             statementDepth--;
             if (boundary) {
                 statementSnapshots = null;
+                if (!inTransaction) {
+                    renameUndo.clear();
+                }
             }
         }
     }
@@ -4093,8 +5822,7 @@ final class Engine implements AutoCloseable {
         for (int index : primaryIndexes) {
             Column column = columns.get(index);
             if (!column.notNull) {
-                columns.set(index, new Column(column.name, column.type, column.length, column.scale, true,
-                        column.autoIncrement, column.nextIdentity, column.hasDefault, column.defaultValue));
+                columns.set(index, column.asNotNull());
             }
         }
         Schema schema = new Schema(name, columns, primaryIndexes, List.of(), List.of());
@@ -4114,13 +5842,701 @@ final class Engine implements AutoCloseable {
 
     private Column column(ColDef definition) {
         Names.checkName(definition.name(), "column");
-        Object def = null;
-        if (definition.hasDefault() && definition.defaultValue() != null) {
-            def = Values.coerce(definition.type(), definition.length(), definition.scale(), definition.defaultValue());
+        DataType type = definition.type();
+        int length = definition.length();
+        int scale = definition.scale();
+        String domainName = definition.domain();
+        StoredDomain domain = null;
+        if (domainName != null) {
+            domain = requireDomain(domainName);
+            type = domain.type;
+            length = domain.length;
+            scale = domain.scale;
         }
-        return new Column(definition.name(), definition.type(), definition.length(), definition.scale(),
-                definition.notNull() || definition.primaryKey(), definition.autoIncrement(),
-                definition.autoIncrement() ? 1L : 0L, definition.hasDefault(), def);
+        if (definition.generated() != null && (definition.primaryKey() || definition.unique())) {
+            throw new SeaException("generated column cannot be a key: " + definition.name());
+        }
+        String generated = definition.generated();
+        if (generated != null) {
+            rejectRowExpr(SqlParser.parseExpression(generated));
+        }
+        String defaultExpr = definition.defaultSource();
+        if (defaultExpr == null && domain != null && domain.defaultSource != null && !definition.hasDefault()) {
+            defaultExpr = domain.defaultSource;
+        }
+        if (defaultExpr != null) {
+            rejectRowExpr(SqlParser.parseExpression(defaultExpr));
+        }
+        Object def = null;
+        boolean hasDefault = definition.hasDefault() || defaultExpr != null;
+        if (definition.hasDefault() && definition.defaultValue() != null && defaultExpr == null) {
+            def = Values.coerce(type, length, scale, definition.defaultValue());
+        }
+        return new Column(definition.name(), type, length, scale, definition.notNull() || definition.primaryKey(),
+                definition.autoIncrement(), definition.autoIncrement() ? 1L : 0L, hasDefault, def,
+                definition.collation(), domainName, generated, defaultExpr);
+    }
+
+    private List<CheckConstraint> tableChecks(Schema schema, CreateTable statement) {
+        List<CheckConstraint> checks = new ArrayList<>();
+        Set<String> used = new HashSet<>();
+        int sequence = 1;
+        for (ColDef definition : statement.columns()) {
+            if (definition.checkSource() == null) {
+                continue;
+            }
+            String name = definition.checkName() == null ? "CK_" + schema.name + "_" + sequence++ : definition.checkName();
+            addCheckSpec(checks, used, name, definition.name(), definition.checkSource());
+        }
+        for (CheckSpec spec : statement.checks()) {
+            String name = spec.name() == null || spec.name().isBlank() ? "CK_" + schema.name + "_" + sequence++ : spec.name();
+            addCheckSpec(checks, used, name, spec.column(), spec.expression());
+        }
+        return checks;
+    }
+
+    private void addCheckSpec(List<CheckConstraint> checks, Set<String> used, String name, String column, String expression) {
+        Names.checkName(name, "constraint");
+        if (!used.add(Names.fold(name))) {
+            throw new SeaException("constraint already exists: " + name);
+        }
+        rejectRowExpr(SqlParser.parseExpression(expression));
+        checks.add(new CheckConstraint(name, column, expression));
+    }
+
+    private void alterColumnType(AlterColumnType statement) {
+        guardDdl(statement.table());
+        rejectBorrowed(require(statement.table()));
+        mutating(statement.table(), () -> {
+            TableStore table = require(statement.table());
+            int index = columnIndex(table.schema(), statement.column());
+            Column current = table.schema().columns.get(index);
+            if (current.generated != null) {
+                throw new SeaException("generated column cannot change type: " + current.name);
+            }
+            table.installSchema(table.schema().withColumn(index, current.retyped(statement.type(), statement.length(), statement.scale())));
+            return 0;
+        });
+    }
+
+    private void alterColumnNull(AlterColumnNull statement) {
+        guardDdl(statement.table());
+        rejectBorrowed(require(statement.table()));
+        mutating(statement.table(), () -> {
+            TableStore table = require(statement.table());
+            Schema schema = table.schema();
+            int index = columnIndex(schema, statement.column());
+            if (!statement.notNull()) {
+                for (int key : schema.primaryKey) {
+                    if (key == index) {
+                        throw new SeaException("primary key column cannot drop NOT NULL");
+                    }
+                }
+            }
+            if (statement.notNull()) {
+                for (StoredRow row : table.scan()) {
+                    if (table.value(row, index) == null) {
+                        throw new SeaException("column contains NULL: " + statement.column());
+                    }
+                }
+            }
+            table.installSchema(schema.withColumn(index, schema.columns.get(index).withNullability(statement.notNull())));
+            return 0;
+        });
+    }
+
+    private void alterColumnDefault(AlterColumnDefault statement) {
+        guardDdl(statement.table());
+        rejectBorrowed(require(statement.table()));
+        mutating(statement.table(), () -> {
+            TableStore table = require(statement.table());
+            int index = columnIndex(table.schema(), statement.column());
+            Column current = table.schema().columns.get(index);
+            Column next;
+            if (statement.expression() == null) {
+                next = current.withDefault(false, null, null);
+            } else {
+                Expr expr = SqlParser.parseExpression(statement.expression());
+                if (expr instanceof Literal literal) {
+                    Object value = literal.value() == null ? null
+                            : Values.coerce(current.type, current.length, current.scale, literal.value());
+                    next = current.withDefault(true, value, null);
+                } else {
+                    rejectRowExpr(expr);
+                    next = current.withDefault(true, null, statement.expression());
+                }
+            }
+            table.installSchema(table.schema().withColumn(index, next));
+            return 0;
+        });
+    }
+
+    private void renameColumn(RenameColumn statement) {
+        guardDdl(statement.table());
+        rejectBorrowed(require(statement.table()));
+        mutating(statement.table(), () -> {
+            TableStore table = require(statement.table());
+            int index = columnIndex(table.schema(), statement.column());
+            Names.checkName(statement.name(), "column");
+            if (table.schema().indexOf(statement.name()) >= 0) {
+                throw new SeaException("column already exists: " + statement.name());
+            }
+            String catalog = Relation.catalogName(table.namespace(), table.schema().name);
+            table.installSchema(table.schema().withColumn(index, table.schema().columns.get(index).renamed(statement.name())));
+            rewriteQuoted(catalog, table.schema().name, statement.column(), statement.name());
+            retargetReferencedColumns(table.namespace(), table.schema().name, statement.column(), statement.name());
+            return 0;
+        });
+    }
+
+    private void renameTable(RenameTable statement) {
+        TableStore table = require(statement.table());
+        guardDdl(statement.table());
+        rejectBorrowed(table);
+        Relation next = relation(statement.name());
+        if (!Names.same(next.schema(), table.namespace())) {
+            throw new SeaException("RENAME cannot change the schema");
+        }
+        Names.checkName(next.name(), "table");
+        if (SystemTables.isSystem(next.name()) || tables.containsKey(next.key()) || findView(statement.name()) != null) {
+            throw new SeaException("table already exists: " + shown(statement.name()));
+        }
+        mutating(statement.table(), () -> {
+            String oldName = table.schema().name;
+            String oldKey = Relation.key(table.namespace(), oldName);
+            String oldCatalog = Relation.catalogName(table.namespace(), oldName);
+            String newCatalog = Relation.catalogName(next.schema(), next.name());
+            tables.remove(oldKey);
+            tables.put(next.key(), table);
+            renameUndo.add(() -> {
+                tables.remove(next.key());
+                tables.put(oldKey, table);
+            });
+            table.installSchema(table.schema().renamed(next.name()));
+            rewriteQuoted(oldCatalog, oldName, oldName, next.name());
+            retargetReferencedTables(table.namespace(), oldName, next.name());
+            systemExecute("UPDATE SEA$PRIVILEGES SET SEA$TABLE_NAME = ? WHERE SEA$TABLE_NAME = ?", newCatalog, oldCatalog);
+            systemExecute("UPDATE SEA$VIEWS SET SEA$RELATION_NAME = ? WHERE SEA$RELATION_NAME = ?", newCatalog, oldCatalog);
+            systemExecute("UPDATE SEA$TRIGGERS SET SEA$RELATION_NAME = ? WHERE SEA$RELATION_NAME = ?", newCatalog, oldCatalog);
+            return 0;
+        });
+    }
+
+    private void addCheck(AddCheck statement) {
+        guardDdl(statement.table());
+        rejectBorrowed(require(statement.table()));
+        mutating(statement.table(), () -> {
+            TableStore table = require(statement.table());
+            Schema schema = table.schema();
+            String name = statement.name() == null || statement.name().isBlank()
+                    ? "CK_" + schema.name + "_" + (schema.checks.size() + 1) : statement.name();
+            for (CheckConstraint check : schema.checks) {
+                if (Names.same(check.name, name)) {
+                    throw new SeaException("constraint already exists: " + name);
+                }
+            }
+            Expr expr = SqlParser.parseExpression(statement.expression());
+            rejectRowExpr(expr);
+            for (StoredRow row : table.scan()) {
+                Object result = evalRow(schema, logical(table, row), expr);
+                if (Boolean.FALSE.equals(result)) {
+                    throw new SeaException("check constraint failed: " + name);
+                }
+            }
+            List<CheckConstraint> checks = new ArrayList<>(schema.checks);
+            checks.add(new CheckConstraint(name, statement.column(), statement.expression()));
+            table.installSchema(schema.withChecks(checks));
+            return 0;
+        });
+    }
+
+    private void rewriteQuoted(String catalog, String tableName, String from, String to) {
+        rewriteText(SystemTables.VIEWS, "SEA$VIEW_NAME", "SEA$VIEW_SOURCE", "SEA$RELATION_NAME", "SEA$COLUMNS",
+                catalog, tableName, from, to);
+        rewriteText(SystemTables.TRIGGERS, "SEA$TRIGGER_NAME", "SEA$TRIGGER_SOURCE", "SEA$RELATION_NAME", null,
+                catalog, tableName, from, to);
+    }
+
+    private void rewriteText(String catalogTable, String keyColumn, String sourceColumn, String relationColumn,
+                             String columnsColumn, String catalog, String tableName, String from, String to) {
+        TableStore store = systemTable(catalogTable);
+        if (store == null) {
+            return;
+        }
+        for (StoredRow row : new ArrayList<>(store.scan())) {
+            String relation = text(store, row, relationColumn);
+            String source = text(store, row, sourceColumn);
+            if (source == null) {
+                continue;
+            }
+            if (!Names.same(relation, catalog) && !SqlText.cites(source, tableName)) {
+                continue;
+            }
+            String updated = SqlText.rename(source, from, to);
+            if (!updated.equals(source)) {
+                systemExecute("UPDATE " + catalogTable + " SET " + sourceColumn + " = ? WHERE " + keyColumn + " = ?",
+                        updated, text(store, row, keyColumn));
+            }
+            if (columnsColumn != null) {
+                String columns = text(store, row, columnsColumn);
+                if (columns != null) {
+                    String[] parts = columns.split(VIEW_COLUMN_SEPARATOR, -1);
+                    boolean changed = false;
+                    for (int i = 0; i < parts.length; i++) {
+                        if (Names.same(parts[i], from)) {
+                            parts[i] = to;
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        systemExecute("UPDATE " + catalogTable + " SET " + columnsColumn + " = ? WHERE " + keyColumn + " = ?",
+                                String.join(VIEW_COLUMN_SEPARATOR, parts), text(store, row, keyColumn));
+                    }
+                }
+            }
+        }
+    }
+
+    private void retargetReferencedTables(String namespace, String from, String to) {
+        for (TableStore other : new ArrayList<>(tables.values())) {
+            boolean changed = false;
+            List<ForeignKey> keys = new ArrayList<>();
+            for (ForeignKey key : other.schema().foreignKeys) {
+                if (Names.same(key.referencedSchema, namespace) && Names.same(key.referencedTable, from)) {
+                    changed = true;
+                    keys.add(new ForeignKey(key.name, key.columns, key.referencedSchema, to, key.referencedColumns,
+                            key.indexName, key.descending, key.onUpdate, key.onDelete));
+                } else {
+                    keys.add(key);
+                }
+            }
+            if (changed) {
+                other.installSchema(other.schema().withForeignKeys(keys));
+            }
+        }
+    }
+
+    private void retargetReferencedColumns(String namespace, String table, String from, String to) {
+        for (TableStore other : new ArrayList<>(tables.values())) {
+            boolean changed = false;
+            List<ForeignKey> keys = new ArrayList<>();
+            for (ForeignKey key : other.schema().foreignKeys) {
+                if (Names.same(key.referencedSchema, namespace) && Names.same(key.referencedTable, table)) {
+                    String[] columns = key.referencedColumns.clone();
+                    for (int i = 0; i < columns.length; i++) {
+                        if (Names.same(columns[i], from)) {
+                            columns[i] = to;
+                            changed = true;
+                        }
+                    }
+                    keys.add(new ForeignKey(key.name, key.columns, key.referencedSchema, key.referencedTable, columns,
+                            key.indexName, key.descending, key.onUpdate, key.onDelete));
+                } else {
+                    keys.add(key);
+                }
+            }
+            if (changed) {
+                other.installSchema(other.schema().withForeignKeys(keys));
+            }
+        }
+    }
+
+    private int columnIndex(Schema schema, String name) {
+        int index = schema.indexOf(name);
+        if (index < 0) {
+            throw new SeaException("column not found: " + name);
+        }
+        return index;
+    }
+
+    private void fillDefaults(Schema schema, Object[] values) {
+        for (int i = 0; i < schema.columns.size(); i++) {
+            Column column = schema.columns.get(i);
+            if (values[i] != Values.MISSING || column.defaultExpr == null) {
+                continue;
+            }
+            Object raw = evalRow(schema, values, SqlParser.parseExpression(column.defaultExpr));
+            values[i] = prepared(schema, column, raw);
+        }
+    }
+
+    private void applyGenerated(Schema schema, Object[] values) {
+        for (int i = 0; i < schema.columns.size(); i++) {
+            Column column = schema.columns.get(i);
+            if (column.generated == null) {
+                continue;
+            }
+            Object raw = evalRow(schema, values, SqlParser.parseExpression(column.generated));
+            values[i] = prepared(schema, column, raw);
+        }
+    }
+
+    private void enforceChecks(Schema schema, Object[] values) {
+        for (CheckConstraint check : schema.checks) {
+            Object result = evalRow(schema, values, SqlParser.parseExpression(check.expression));
+            if (Boolean.FALSE.equals(result)) {
+                throw new SeaException("check constraint failed: " + check.name);
+            }
+        }
+        for (Column column : schema.columns) {
+            if (column.domain == null) {
+                continue;
+            }
+            StoredDomain domain = findDomain(column.domain);
+            if (domain == null || domain.check == null || domain.check.isBlank()) {
+                continue;
+            }
+            int index = schema.indexOf(column.name);
+            Object value = values[index] == Values.MISSING ? null : values[index];
+            Schema probe = new Schema("VALUE", List.of(new Column("VALUE", column.type, column.length, column.scale,
+                    false, false, 0L, false, null)), new int[0], List.of(), List.of());
+            Object result = evalRow(probe, new Object[]{value}, SqlParser.parseExpression(domain.check));
+            if (Boolean.FALSE.equals(result)) {
+                throw new SeaException("check constraint failed: " + column.domain);
+            }
+        }
+    }
+
+    private Object evalRow(Schema schema, Object[] values, Expr expr) {
+        Evaluator evaluator = evaluator(null, null);
+        evaluator.useView(schema, schema.name);
+        Object[] visible = new Object[values.length];
+        for (int i = 0; i < values.length; i++) {
+            visible[i] = values[i] == Values.MISSING ? null : values[i];
+        }
+        evaluator.bindView(visible);
+        return evaluator.eval(expr);
+    }
+
+    private void rejectRowExpr(Expr expr) {
+        if (expr == null) {
+            return;
+        }
+        switch (expr) {
+            case ScalarSubquery ignored -> throw new SeaException("expression cannot use a subquery");
+            case InSubquery ignored -> throw new SeaException("expression cannot use a subquery");
+            case ExistsExpr ignored -> throw new SeaException("expression cannot use a subquery");
+            case WindowExpr ignored -> throw new SeaException("expression cannot use a window");
+            case Call call -> {
+                if (Evaluator.aggregate(call.name())) {
+                    throw new SeaException("expression cannot use an aggregate");
+                }
+                for (Expr arg : call.args()) {
+                    rejectRowExpr(arg);
+                }
+            }
+            case Unary unary -> rejectRowExpr(unary.expr());
+            case Binary binary -> {
+                rejectRowExpr(binary.left());
+                rejectRowExpr(binary.right());
+            }
+            case IsNull isNull -> rejectRowExpr(isNull.expr());
+            case Like like -> {
+                rejectRowExpr(like.expr());
+                rejectRowExpr(like.pattern());
+                rejectRowExpr(like.escape());
+            }
+            case InList inList -> {
+                rejectRowExpr(inList.expr());
+                for (Expr value : inList.values()) {
+                    rejectRowExpr(value);
+                }
+            }
+            case Between between -> {
+                rejectRowExpr(between.expr());
+                rejectRowExpr(between.low());
+                rejectRowExpr(between.high());
+            }
+            case CaseExpr caseExpr -> {
+                rejectRowExpr(caseExpr.operand());
+                for (WhenBranch branch : caseExpr.branches()) {
+                    rejectRowExpr(branch.when());
+                    rejectRowExpr(branch.then());
+                }
+                rejectRowExpr(caseExpr.otherwise());
+            }
+            case CastExpr cast -> rejectRowExpr(cast.expr());
+            default -> {
+            }
+        }
+    }
+
+    private void createDomain(CreateDomain statement) {
+        ensureCatalog(SystemTables.DOMAINS, SystemTables.domains());
+        Relation rel = relation(statement.name());
+        Names.checkName(rel.name(), "domain");
+        if (findDomain(statement.name()) != null) {
+            throw new SeaException("domain already exists: " + shown(statement.name()));
+        }
+        if (statement.checkSource() != null) {
+            rejectRowExpr(SqlParser.parseExpression(statement.checkSource()));
+        }
+        if (statement.defaultSource() != null) {
+            rejectRowExpr(SqlParser.parseExpression(statement.defaultSource()));
+        }
+        systemExecute("""
+                INSERT INTO SEA$DOMAINS (
+                    SEA$SCHEMA_NAME, SEA$DOMAIN_NAME, SEA$FIELD_TYPE, SEA$FIELD_LENGTH, SEA$FIELD_SCALE,
+                    SEA$DEFAULT_SOURCE, SEA$CHECK_SOURCE, SEA$OWNER_NAME
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, rel.schema(), rel.name(), statement.type().name(), statement.length(), statement.scale(),
+                statement.defaultSource(), statement.checkSource(), ownerName());
+    }
+
+    private void dropDomain(DropDomain statement) {
+        StoredDomain domain = findDomain(statement.name());
+        if (domain == null) {
+            if (statement.ifExists()) {
+                return;
+            }
+            throw new SeaException("domain not found: " + shown(statement.name()));
+        }
+        for (TableStore table : tables.values()) {
+            for (Column column : table.schema().columns) {
+                if (column.domain != null && Names.same(column.domain, domain.name)) {
+                    throw new SeaException("domain is in use: " + domain.name);
+                }
+            }
+        }
+        systemExecute("DELETE FROM SEA$DOMAINS WHERE SEA$SCHEMA_NAME = ? AND SEA$DOMAIN_NAME = ?",
+                domain.schema, domain.name);
+    }
+
+    private StoredDomain requireDomain(String name) {
+        StoredDomain domain = findDomain(name);
+        if (domain == null) {
+            throw new SeaException("domain not found: " + shown(name));
+        }
+        return domain;
+    }
+
+    private StoredDomain findDomain(String name) {
+        TableStore store = systemTable(SystemTables.DOMAINS);
+        if (store == null) {
+            return null;
+        }
+        Relation rel = relation(name);
+        for (StoredRow row : store.scan()) {
+            if (!Names.same(text(store, row, "SEA$SCHEMA_NAME"), rel.schema())
+                    || !Names.same(text(store, row, "SEA$DOMAIN_NAME"), rel.name())) {
+                continue;
+            }
+            String typeName = text(store, row, "SEA$FIELD_TYPE");
+            DataType type = DataType.valueOf(typeName);
+            int length = (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$FIELD_LENGTH")));
+            int scale = (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$FIELD_SCALE")));
+            return new StoredDomain(rel.schema(), rel.name(), type, length, scale,
+                    text(store, row, "SEA$DEFAULT_SOURCE"), text(store, row, "SEA$CHECK_SOURCE"),
+                    text(store, row, "SEA$OWNER_NAME"));
+        }
+        return null;
+    }
+
+    private void createFunction(CreateFunction statement) {
+        ensureCatalog(SystemTables.FUNCTIONS, SystemTables.functions());
+        ensureCatalog(SystemTables.FUNCTION_PARAMETERS, SystemTables.functionParameters());
+        Relation rel = relation(statement.name());
+        Names.checkName(rel.name(), "function");
+        if (SystemTables.isSystem(rel.name())) {
+            throw new SeaException("reserved name: " + rel.name());
+        }
+        StoredFunction existing = findFunction(statement.name());
+        if (existing != null) {
+            if (!statement.orReplace()) {
+                throw new SeaException("function already exists: " + shown(statement.name()));
+            }
+            if (existing.type != statement.type()) {
+                throw new SeaException("function return type changed: " + shown(statement.name()));
+            }
+            guardRoutine("the function", existing.label(), existing.owner, null);
+            systemExecute("DELETE FROM SEA$FUNCTION_PARAMETERS WHERE SEA$SCHEMA_NAME = ? AND SEA$FUNCTION_NAME = ?",
+                    existing.schema, existing.name);
+            insertFunctionParameters(existing.schema, existing.name, statement.inputs());
+            systemExecute("""
+                    UPDATE SEA$FUNCTIONS SET SEA$FUNCTION_SOURCE = ?
+                    WHERE SEA$SCHEMA_NAME = ? AND SEA$FUNCTION_NAME = ?
+                    """, statement.source(), existing.schema, existing.name);
+            return;
+        }
+        systemExecute("""
+                INSERT INTO SEA$FUNCTIONS (
+                    SEA$SCHEMA_NAME, SEA$FUNCTION_NAME, SEA$FUNCTION_SOURCE, SEA$RETURN_TYPE,
+                    SEA$RETURN_LENGTH, SEA$RETURN_SCALE, SEA$OWNER_NAME
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, rel.schema(), rel.name(), statement.source(), statement.type().name(),
+                statement.length(), statement.scale(), ownerName());
+        insertFunctionParameters(rel.schema(), rel.name(), statement.inputs());
+        recordOwner(routineKey("FUNCTION", rel.schema(), rel.name()));
+    }
+
+    private void insertFunctionParameters(String schema, String function, List<ParamDef> parameters) {
+        for (int i = 0; i < parameters.size(); i++) {
+            ParamDef parameter = parameters.get(i);
+            systemExecute("""
+                    INSERT INTO SEA$FUNCTION_PARAMETERS (
+                        SEA$SCHEMA_NAME, SEA$FUNCTION_NAME, SEA$PARAMETER_NAME, SEA$PARAMETER_NUMBER,
+                        SEA$FIELD_TYPE, SEA$FIELD_LENGTH, SEA$FIELD_SCALE
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, schema, function, parameter.name(), i, parameter.type().name(), parameter.length(), parameter.scale());
+        }
+    }
+
+    private void dropFunction(DropFunction statement) {
+        StoredFunction function = findFunction(statement.name());
+        if (function == null) {
+            if (statement.ifExists()) {
+                return;
+            }
+            throw new SeaException("function not found: " + shown(statement.name()));
+        }
+        guardRoutine("the function", function.label(), function.owner, null);
+        systemExecute("DELETE FROM SEA$FUNCTION_PARAMETERS WHERE SEA$SCHEMA_NAME = ? AND SEA$FUNCTION_NAME = ?",
+                function.schema, function.name);
+        systemExecute("DELETE FROM SEA$FUNCTIONS WHERE SEA$SCHEMA_NAME = ? AND SEA$FUNCTION_NAME = ?",
+                function.schema, function.name);
+        forgetPrivileges(routineKey("FUNCTION", function.schema, function.name));
+    }
+
+    private Object callUserFunction(String name, List<Object> args) {
+        StoredFunction function = findFunction(name);
+        if (function == null) {
+            throw new SeaException("unknown function: " + name);
+        }
+        guardExecute("FUNCTION", function.schema, function.name, function.owner);
+        List<ParamDef> inputs = functionInputs(function);
+        if (args.size() != inputs.size()) {
+            throw new SeaException("function " + function.label() + " expects " + inputs.size() + " arguments");
+        }
+        Object[] coerced = new Object[args.size()];
+        for (int i = 0; i < args.size(); i++) {
+            ParamDef input = inputs.get(i);
+            coerced[i] = args.get(i) == null ? null : Values.coerce(input.type(), input.length(), input.scale(), args.get(i));
+        }
+        Routine routine = SqlParser.parseRoutine(function.source);
+        String previousPin = pinnedSchema;
+        pinnedSchema = function.schema;
+        try {
+            runRoutine(routine, inputs, List.of(), coerced, false);
+            Object value = lastReturn;
+            return value == null ? null : Values.coerce(function.type, function.length, function.scale, value);
+        } finally {
+            pinnedSchema = previousPin;
+        }
+    }
+
+    private List<ParamDef> functionInputs(StoredFunction function) {
+        TableStore store = require(SystemTables.FUNCTION_PARAMETERS);
+        List<ParamDef> inputs = new ArrayList<>();
+        for (StoredRow row : store.scan()) {
+            if (!Names.same(text(store, row, "SEA$SCHEMA_NAME"), function.schema)
+                    || !Names.same(text(store, row, "SEA$FUNCTION_NAME"), function.name)) {
+                continue;
+            }
+            inputs.add(new ParamDef(text(store, row, "SEA$PARAMETER_NAME"),
+                    DataType.valueOf(text(store, row, "SEA$FIELD_TYPE")),
+                    (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$FIELD_LENGTH"))),
+                    (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$FIELD_SCALE")))));
+        }
+        return inputs;
+    }
+
+    private StoredFunction findFunction(String name) {
+        TableStore store = systemTable(SystemTables.FUNCTIONS);
+        if (store == null) {
+            return null;
+        }
+        Relation rel = relation(name);
+        for (StoredRow row : store.scan()) {
+            if (!Names.same(text(store, row, "SEA$SCHEMA_NAME"), rel.schema())
+                    || !Names.same(text(store, row, "SEA$FUNCTION_NAME"), rel.name())) {
+                continue;
+            }
+            return new StoredFunction(rel.schema(), rel.name(), text(store, row, "SEA$FUNCTION_SOURCE"),
+                    DataType.valueOf(text(store, row, "SEA$RETURN_TYPE")),
+                    (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$RETURN_LENGTH"))),
+                    (int) Values.toLong(store.value(row, store.schema().indexOf("SEA$RETURN_SCALE"))),
+                    text(store, row, "SEA$OWNER_NAME"));
+        }
+        return null;
+    }
+
+    private SqlResult executeBlock(ExecuteBlock block) {
+        Object[] args = new Object[block.inputs().size()];
+        Evaluator evaluator = evaluator(null, null);
+        for (int i = 0; i < args.length; i++) {
+            Object raw = evaluator.eval(block.defaults().get(i));
+            ParamDef input = block.inputs().get(i);
+            args[i] = raw == null ? null : Values.coerce(input.type(), input.length(), input.scale(), raw);
+        }
+        Routine routine = SqlParser.parseRoutine(block.source());
+        List<Object[]> rows = runRoutine(routine, block.inputs(), block.outputs(), args, !block.outputs().isEmpty());
+        if (block.outputs().isEmpty()) {
+            return SqlResult.update(0);
+        }
+        List<ColumnMeta> columns = outputColumns(block.outputs());
+        List<Row> result = new ArrayList<>();
+        for (Object[] values : rows) {
+            result.add(new Row(columns, values));
+        }
+        return SqlResult.query(columns, result);
+    }
+
+    private void grantExecute(String kind, String name, String user, boolean grant) {
+        String owner;
+        Relation rel = relation(name);
+        if (kind.equals("FUNCTION")) {
+            StoredFunction function = findFunction(name);
+            if (function == null) {
+                throw new SeaException("function not found: " + shown(name));
+            }
+            owner = function.owner;
+        } else {
+            StoredProcedure procedure = findProcedure(name);
+            if (procedure == null) {
+                throw new SeaException("procedure not found: " + shown(name));
+            }
+            owner = procedure.owner();
+        }
+        String key = routineKey(kind, rel.schema(), rel.name());
+        String grantee = normalizeUser(user);
+        if (!Names.same(grantee, SystemTables.PUBLIC)) {
+            requireActiveUser(grantee);
+        }
+        if (!grant) {
+            systemExecute("""
+                    DELETE FROM SEA$PRIVILEGES
+                    WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ?
+                    """, grantee, key, "EXECUTE");
+            return;
+        }
+        if (actor != null && !actor.admin && !Names.same(actor.user, owner)) {
+            throw new SeaException("user " + actor.user + " cannot grant EXECUTE on " + shown(name));
+        }
+        savePrivilege(grantee, key, "EXECUTE", false, actor == null ? SystemTables.PUBLIC : actor.user);
+    }
+
+    private void guardExecute(String kind, String schema, String name, String owner) {
+        if (bypass || (actor != null && actor.admin) || (actor != null && Names.same(actor.user, owner))) {
+            return;
+        }
+        String key = routineKey(kind, schema, name);
+        if (holds(actor, key, "EXECUTE") || holds(SystemTables.PUBLIC, key, "EXECUTE")
+                || (actor != null && actor.role != null && holds(actor.role, key, "EXECUTE"))) {
+            return;
+        }
+        String who = actor == null ? "session" : actor.user;
+        throw new SeaException("user " + who + " does not have EXECUTE on " + name);
+    }
+
+    private static String routineKey(String kind, String schema, String name) {
+        return kind + " " + Relation.catalogName(schema, name);
+    }
+
+    private void ensureCatalog(String name, Schema schema) {
+        if (systemTable(name) != null) {
+            return;
+        }
+        createStored(schema, Relation.PUBLIC);
     }
 
     private int[] resolve(List<Column> columns, List<String> names, String kind) {
@@ -4297,7 +6713,11 @@ final class Engine implements AutoCloseable {
         DatabaseFile.Allocator draft = storage.draft();
         try {
             storage.armScrub();
-            for (Schema schema : SystemTables.schemas()) {
+            List<Schema> created = new ArrayList<>(SystemTables.schemas());
+            created.add(SystemTables.statistics());
+            created.add(SystemTables.columnPrivileges());
+            created.add(SystemTables.remarks());
+            for (Schema schema : created) {
                 long capacity = DatabaseFile.capacityFor(Format.HEADER_SIZE + 1024, storage.pageSize());
                 long base = draft.allocate(capacity);
                 storage.zero(base, capacity);
@@ -4534,7 +6954,8 @@ final class Engine implements AutoCloseable {
             return;
         }
         if (owns(table) || holds(actor, table, privilege) || holds(SystemTables.PUBLIC, table, privilege)
-                || (actor != null && actor.role != null && holds(actor.role, table, privilege))) {
+                || (actor != null && actor.role != null && holds(actor.role, table, privilege))
+                || columnHeld(table, privilege)) {
             return;
         }
         String who = actor == null ? "session" : actor.user;
@@ -4548,26 +6969,52 @@ final class Engine implements AutoCloseable {
             requireActiveUser(grantee);
         }
         String grantor = actor == null ? SystemTables.PUBLIC : actor.user;
+        List<String> columns = statement.columns() == null ? List.of() : statement.columns();
+        if (!columns.isEmpty()) {
+            TableStore target = findTable(table);
+            for (String column : columns) {
+                if (target == null || target.schema().indexOf(column) < 0) {
+                    throw new SeaException("column not found: " + column);
+                }
+            }
+        }
         for (String privilege : statement.privileges()) {
             if (!canGrant(table, privilege)) {
                 throw new SeaException("user " + grantor + " cannot grant " + privilege + " on " + table);
             }
-            savePrivilege(grantee, table, privilege, statement.grantOption(), grantor);
+            if (columns.isEmpty()) {
+                savePrivilege(grantee, table, privilege, statement.grantOption(), grantor);
+            } else {
+                for (String column : columns) {
+                    saveColumnPrivilege(grantee, table, privilege, column, statement.grantOption(), grantor);
+                }
+            }
         }
     }
 
     private void revoke(Revoke statement) {
         String table = userTable(statement.table());
         String grantee = normalizeUser(statement.user());
+        List<String> columns = statement.columns() == null ? List.of() : statement.columns();
         for (String privilege : statement.privileges()) {
             if (!canRevoke(table, grantee, privilege)) {
                 String who = actor == null ? "session" : actor.user;
                 throw new SeaException("user " + who + " cannot revoke " + privilege + " on " + table);
             }
-            systemExecute("""
-                    DELETE FROM SEA$PRIVILEGES
-                    WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ?
-                    """, grantee, canonicalTable(table), privilege);
+            if (columns.isEmpty()) {
+                systemExecute("""
+                        DELETE FROM SEA$PRIVILEGES
+                        WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ?
+                        """, grantee, canonicalTable(table), privilege);
+            } else {
+                ensureColumnPrivileges();
+                for (String column : columns) {
+                    systemExecute("""
+                            DELETE FROM SEA$COLUMN_PRIVILEGES
+                            WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ? AND SEA$COLUMN_NAME = ?
+                            """, grantee, canonicalTable(table), privilege, Names.fold(column));
+                }
+            }
         }
     }
 
@@ -4580,6 +7027,256 @@ final class Engine implements AutoCloseable {
 
     private void forgetPrivileges(String table) {
         systemExecute("DELETE FROM SEA$PRIVILEGES WHERE SEA$TABLE_NAME = ?", table);
+        if (systemTable(SystemTables.COLUMN_PRIVILEGES) != null) {
+            systemExecute("DELETE FROM SEA$COLUMN_PRIVILEGES WHERE SEA$TABLE_NAME = ?", table);
+        }
+    }
+
+    private void saveColumnPrivilege(String user, String table, String privilege, String column,
+                                     boolean grantOption, String grantor) {
+        TableStore target = findTable(table);
+        if (target == null || target.schema().indexOf(column) < 0) {
+            throw new SeaException("column not found: " + column);
+        }
+        ensureColumnPrivileges();
+        String storedTable = canonicalTable(table);
+        String storedColumn = Names.fold(column);
+        SqlResult existing = systemExecute("""
+                SELECT SEA$COLUMN_NAME FROM SEA$COLUMN_PRIVILEGES
+                WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ? AND SEA$COLUMN_NAME = ?
+                """, user, storedTable, privilege, storedColumn);
+        if (existing.size() == 0) {
+            systemExecute("""
+                    INSERT INTO SEA$COLUMN_PRIVILEGES (
+                        SEA$USER_NAME, SEA$TABLE_NAME, SEA$PRIVILEGE, SEA$COLUMN_NAME, SEA$GRANT_OPTION, SEA$GRANTOR
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """, user, storedTable, privilege, storedColumn, grantOption, grantor);
+            return;
+        }
+        systemExecute("""
+                UPDATE SEA$COLUMN_PRIVILEGES
+                SET SEA$GRANT_OPTION = ?, SEA$GRANTOR = ?
+                WHERE SEA$USER_NAME = ? AND SEA$TABLE_NAME = ? AND SEA$PRIVILEGE = ? AND SEA$COLUMN_NAME = ?
+                """, grantOption, grantor, user, storedTable, privilege, storedColumn);
+    }
+
+    private void ensureColumnPrivileges() {
+        if (systemTable(SystemTables.COLUMN_PRIVILEGES) != null) {
+            return;
+        }
+        if (currentTxn() != null && !suppressCapture && !storage.leaveForRecovery()) {
+            checkpoint(true);
+        }
+        createStored(SystemTables.columnPrivileges(), Relation.PUBLIC);
+    }
+
+    private boolean columnHeld(String table, String privilege) {
+        if (actor == null) {
+            return false;
+        }
+        if (anyColumn(actor.user, table, privilege) || anyColumn(SystemTables.PUBLIC, table, privilege)) {
+            return true;
+        }
+        return actor.role != null && anyColumn(actor.role, table, privilege);
+    }
+
+    private boolean anyColumn(String user, String table, String privilege) {
+        return !grantedColumns(user, table, privilege).isEmpty();
+    }
+
+    private Set<String> columnScope(String table, String privilege) {
+        if (bypass || (actor != null && actor.admin) || SystemTables.isSystem(Relation.parse(table).name())) {
+            return null;
+        }
+        if (owns(table) || holds(actor, table, privilege) || holds(SystemTables.PUBLIC, table, privilege)
+                || (actor != null && actor.role != null && holds(actor.role, table, privilege))) {
+            return null;
+        }
+        Set<String> columns = new HashSet<>();
+        if (actor != null) {
+            columns.addAll(grantedColumns(actor.user, table, privilege));
+            columns.addAll(grantedColumns(SystemTables.PUBLIC, table, privilege));
+            if (actor.role != null) {
+                columns.addAll(grantedColumns(actor.role, table, privilege));
+            }
+        }
+        return columns;
+    }
+
+    private Set<String> whereScope(String table, String privilege) {
+        Set<String> read = columnScope(table, "SELECT");
+        Set<String> write = columnScope(table, privilege);
+        if (read == null || write == null) {
+            return null;
+        }
+        Set<String> either = new HashSet<>(read);
+        either.addAll(write);
+        return either;
+    }
+
+    private Set<String> grantedColumns(String user, String table, String privilege) {
+        Set<String> columns = new HashSet<>();
+        TableStore store = systemTable(SystemTables.COLUMN_PRIVILEGES);
+        if (store == null || user == null) {
+            return columns;
+        }
+        String stored = grantName(table);
+        Schema schema = store.schema();
+        int userIndex = schema.indexOf("SEA$USER_NAME");
+        int tableIndex = schema.indexOf("SEA$TABLE_NAME");
+        int privilegeIndex = schema.indexOf("SEA$PRIVILEGE");
+        int columnIndex = schema.indexOf("SEA$COLUMN_NAME");
+        for (StoredRow row : store.scan()) {
+            Object userValue = store.value(row, userIndex);
+            Object tableValue = store.value(row, tableIndex);
+            Object privilegeValue = store.value(row, privilegeIndex);
+            Object columnValue = store.value(row, columnIndex);
+            if (userValue instanceof String userText && Names.same(userText, user)
+                    && tableValue instanceof String tableText && Names.same(tableText, stored)
+                    && privilegeValue instanceof String privilegeText && privilegeText.equals(privilege)
+                    && columnValue instanceof String columnText) {
+                columns.add(Names.fold(columnText));
+            }
+        }
+        return columns;
+    }
+
+    private void guardWritten(String table, String privilege, List<String> columns, Schema schema) {
+        Set<String> allowed = columnScope(table, privilege);
+        if (allowed == null) {
+            return;
+        }
+        List<String> targets = columns == null || columns.isEmpty()
+                ? schema.columns.stream().map(column -> column.name).toList()
+                : columns;
+        for (String column : targets) {
+            if (schema.indexOf(column) >= 0 && !allowed.contains(Names.fold(column))) {
+                throw new SeaException("column is not granted: " + column);
+            }
+        }
+    }
+
+    private void guardColumnUse(Schema schema, Set<String> allowed, List<SelectItem> items, Expr where) {
+        if (allowed == null) {
+            return;
+        }
+        java.util.function.Consumer<ColumnRef> check = ref -> {
+            if (schema.indexOf(ref.name()) >= 0 && !allowed.contains(Names.fold(ref.name()))) {
+                throw new SeaException("column is not granted: " + ref.name());
+            }
+        };
+        for (SelectItem item : items) {
+            visitColumns(item.expr(), check);
+        }
+        visitColumns(where, check);
+    }
+
+    private void visitColumns(Expr expr, java.util.function.Consumer<ColumnRef> columns) {
+        switch (expr) {
+            case null -> {
+            }
+            case ColumnRef ref -> columns.accept(ref);
+            case Unary unary -> visitColumns(unary.expr(), columns);
+            case Binary binary -> {
+                visitColumns(binary.left(), columns);
+                visitColumns(binary.right(), columns);
+            }
+            case IsNull isNull -> visitColumns(isNull.expr(), columns);
+            case Like like -> {
+                visitColumns(like.expr(), columns);
+                visitColumns(like.pattern(), columns);
+                visitColumns(like.escape(), columns);
+            }
+            case InList in -> {
+                visitColumns(in.expr(), columns);
+                for (Expr value : in.values()) {
+                    visitColumns(value, columns);
+                }
+            }
+            case Between between -> {
+                visitColumns(between.expr(), columns);
+                visitColumns(between.low(), columns);
+                visitColumns(between.high(), columns);
+            }
+            case Call call -> {
+                for (Expr arg : call.args()) {
+                    visitColumns(arg, columns);
+                }
+            }
+            case CastExpr cast -> visitColumns(cast.expr(), columns);
+            case CaseExpr searched -> {
+                visitColumns(searched.operand(), columns);
+                for (WhenBranch branch : searched.branches()) {
+                    visitColumns(branch.when(), columns);
+                    visitColumns(branch.then(), columns);
+                }
+                visitColumns(searched.otherwise(), columns);
+            }
+            case WindowExpr window -> {
+                visitColumns(window.call(), columns);
+                for (Expr part : window.partition()) {
+                    visitColumns(part, columns);
+                }
+                for (OrderItem item : window.orderBy()) {
+                    visitColumns(item.expr(), columns);
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    private void armPace(Session session) {
+        int seconds = Pace.seconds(configInt("Command.Timeout"), requestedTimeout);
+        long deadline = seconds > 0 ? System.currentTimeMillis() + seconds * 1000L : 0L;
+        Pace.arm(session, deadline);
+    }
+
+    private int configInt(String key) {
+        String text = configValue(key);
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(text.trim());
+        } catch (NumberFormatException exception) {
+            return 0;
+        }
+    }
+
+    private String configValue(String key) {
+        TableStore table = systemTable(SystemTables.CONFIG);
+        if (table == null) {
+            return null;
+        }
+        int keyIndex = table.schema().indexOf("SEA$KEY");
+        int valueIndex = table.schema().indexOf("SEA$VALUE");
+        for (StoredRow row : table.scan()) {
+            Object name = table.value(row, keyIndex);
+            if (name instanceof String text && Names.same(text, key)) {
+                Object value = table.value(row, valueIndex);
+                return value == null ? null : value.toString();
+            }
+        }
+        return null;
+    }
+
+    private void audit(String sql, boolean ok) {
+        if (!"on".equalsIgnoreCase(configValue("Audit.Log"))) {
+            return;
+        }
+        String user = actor != null ? actor.user : "";
+        long connection = connected != null ? connected.attachmentId : 0L;
+        String text = sql == null ? "" : sql.replace('\r', ' ').replace('\n', ' ');
+        String line = java.time.Instant.now() + "\t" + user + "\t" + connection + "\t" + (ok ? "ok" : "fail") + "\t" + text;
+        try {
+            Files.writeString(file.resolveSibling(file.getFileName().toString() + ".audit"),
+                    line + System.lineSeparator(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (IOException exception) {
+            if (ok) {
+                throw new SeaException("could not write the audit log");
+            }
+        }
     }
 
     private void savePrivilege(String user, String table, String privilege, boolean grantOption, String grantor) {
@@ -5106,7 +7803,24 @@ final class Engine implements AutoCloseable {
     }
 
     private Evaluator evaluator(TableStore table, String alias) {
-        return new Evaluator(table, params, alias, scope, this::nextGenerator, this::readContext);
+        Evaluator evaluator = new Evaluator(table, params, alias, scope, this::nextGenerator, this::readContext, new Evaluator.Subqueries() {
+            @Override
+            public Object scalar(Query query, Evaluator outer) {
+                return scalarSubquery(query, outer);
+            }
+
+            @Override
+            public Object in(Expr expr, Query query, boolean negated, Evaluator outer) {
+                return inSubquery(expr, query, negated, outer);
+            }
+
+            @Override
+            public Object exists(Query query, Evaluator outer) {
+                return existsSubquery(query, outer);
+            }
+        });
+        evaluator.bindFunctions(this::callUserFunction);
+        return evaluator;
     }
 
     private DataType contextType(ContextRef context) {
@@ -5223,6 +7937,12 @@ final class Engine implements AutoCloseable {
         }
         for (Map.Entry<TableStore, TableStore.Snapshot> entry : statementSnapshots.entrySet()) {
             entry.getKey().restore(entry.getValue());
+        }
+    }
+
+    private void undoRenames(int base) {
+        for (int i = renameUndo.size() - 1; i >= base; i--) {
+            renameUndo.remove(i).run();
         }
     }
 
@@ -5361,8 +8081,13 @@ final class Engine implements AutoCloseable {
         if (statement.source().length() > Format.MAX_CHAR) {
             throw new SeaException("procedure source exceeds " + Format.MAX_CHAR + " characters");
         }
-        if (findProcedure(statement.name()) != null) {
-            throw new SeaException("procedure already exists: " + shown(statement.name()));
+        StoredProcedure existing = findProcedure(statement.name());
+        if (existing != null) {
+            if (!statement.orReplace()) {
+                throw new SeaException("procedure already exists: " + shown(statement.name()));
+            }
+            replaceProcedure(existing, statement);
+            return;
         }
         Set<String> names = new HashSet<>();
         rejectDuplicate(names, statement.inputs());
@@ -5441,6 +8166,7 @@ final class Engine implements AutoCloseable {
         if (procedure == null) {
             throw new SeaException("procedure not found: " + shown(statement.name()));
         }
+        guardExecute("PROCEDURE", procedure.schema(), procedure.name(), procedure.owner());
         String label = procedure.label();
         List<ParamDef> inputs = parameters(procedure.schema(), procedure.name(), 0);
         List<ParamDef> outputs = parameters(procedure.schema(), procedure.name(), 1);
@@ -5497,6 +8223,7 @@ final class Engine implements AutoCloseable {
         enterRoutine();
         try {
             callBody(() -> runPsql(routine.body()));
+            lastReturn = frame.returned;
             if (!selectable && !frame.suspended && !outputs.isEmpty()) {
                 frame.rows.add(outputValues());
             }
@@ -5621,17 +8348,43 @@ final class Engine implements AutoCloseable {
         if (statement.source().length() > Format.MAX_CHAR) {
             throw new SeaException("trigger source exceeds " + Format.MAX_CHAR + " characters");
         }
-        TableStore relation = require(statement.table());
-        guardDdl(relation.schema().name);
-        if (SystemTables.isSystem(relation.schema().name)) {
-            throw new SeaException("system table cannot have a trigger: " + relation.schema().name);
+        boolean instead = statement.phase().startsWith("INSTEAD");
+        TableStore relation = findTable(statement.table());
+        StoredView view = findView(statement.table());
+        if (instead) {
+            if (view == null) {
+                throw new SeaException("INSTEAD OF trigger requires a view: " + shown(statement.table()));
+            }
+            if (relation != null) {
+                throw new SeaException("INSTEAD OF trigger requires a view: " + shown(statement.table()));
+            }
+        } else if (relation == null) {
+            if (view != null) {
+                throw new SeaException("BEFORE or AFTER trigger requires a table: " + shown(statement.table()));
+            }
+            throw new SeaException("table not found: " + shown(statement.table()));
+        }
+        String relationName;
+        String guardName;
+        if (relation != null) {
+            guardDdl(relation.schema().name);
+            if (SystemTables.isSystem(relation.schema().name)) {
+                throw new SeaException("system table cannot have a trigger: " + relation.schema().name);
+            }
+            relationName = Relation.catalogName(relation.namespace(), relation.schema().name);
+            guardName = relation.schema().name;
+        } else {
+            relationName = view.storedKey();
+            guardName = view.name();
+        }
+        if (guardName != null && SystemTables.isSystem(guardName)) {
+            throw new SeaException("system table cannot have a trigger: " + guardName);
         }
         if (findRow(SystemTables.TRIGGERS, "SEA$TRIGGER_NAME", statement.name()) != null) {
             throw new SeaException("trigger already exists: " + statement.name());
         }
         SqlParser.parseRoutine(statement.source());
         String type = statement.phase() + " " + String.join(" OR ", statement.events());
-        String relationName = Relation.catalogName(relation.namespace(), relation.schema().name);
         if (relationName.length() > 128) {
             throw new SeaException("qualified name exceeds 128 characters");
         }
@@ -5757,14 +8510,15 @@ final class Engine implements AutoCloseable {
             return;
         }
         switch (statement) {
-            case PsqlBlock block -> {
-                for (Psql item : block.statements()) {
-                    runPsql(item);
-                    if (psqlHalt) {
-                        return;
-                    }
+            case PsqlBlock block -> runBlock(block);
+            case PsqlReturn returned -> {
+                if (frame == null) {
+                    throw new SeaException("RETURN can only be used in a function or a block");
                 }
+                frame.returned = evalRoutine(returned.value());
+                psqlHalt = true;
             }
+            case PsqlExecuteStatement dynamic -> executeDynamic(dynamic);
             case PsqlAssign assign -> assignPsql(assign);
             case PsqlIf condition -> {
                 if (truthRoutine(condition.condition())) {
@@ -5798,7 +8552,7 @@ final class Engine implements AutoCloseable {
             }
             case PsqlException error -> {
                 Object message = evalRoutine(error.message());
-                throw new SeaException(message == null ? "exception" : String.valueOf(message));
+                throw new Raised(message == null ? "exception" : String.valueOf(message));
             }
             case PsqlInsert insert -> scope.rowCount = insert(insert.statement());
             case PsqlUpdate update -> scope.rowCount = update(update.statement());
@@ -6189,6 +8943,94 @@ final class Engine implements AutoCloseable {
     /** Splits output names from the base columns captured before ALTER COLUMN POSITION. */
     private static final String VIEW_BINDING_SEPARATOR = "\u001e";
 
+    private void applyWindows(List<Projected> rows, List<SelectItem> items, List<OrderItem> order, Evaluator evaluator) {
+        orderWindows.clear();
+        List<WindowExpr> selected = new ArrayList<>();
+        List<Integer> indexes = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            if (items.get(i).expr() instanceof WindowExpr window) {
+                selected.add(window);
+                indexes.add(i);
+            }
+        }
+        List<WindowExpr> extra = new ArrayList<>();
+        for (OrderItem item : order) {
+            if (item.expr() instanceof WindowExpr window && selectIndex(window, items) == null) {
+                extra.add(window);
+            }
+        }
+        if (selected.isEmpty() && extra.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < selected.size(); i++) {
+            Object[] values = windowValues(selected.get(i), rows, evaluator);
+            int slot = indexes.get(i);
+            for (int row = 0; row < rows.size(); row++) {
+                rows.get(row).values[slot] = values[row];
+            }
+        }
+        for (WindowExpr window : extra) {
+            Object[] values = windowValues(window, rows, evaluator);
+            for (int row = 0; row < rows.size(); row++) {
+                orderWindows.computeIfAbsent(rows.get(row), key -> new IdentityHashMap<>()).put(window, values[row]);
+            }
+        }
+    }
+
+    private Object[] windowValues(WindowExpr window, List<Projected> rows, Evaluator evaluator) {
+        List<Object[]> partitions = new ArrayList<>();
+        List<Object[]> ordering = new ArrayList<>();
+        List<Object> args = new ArrayList<>();
+        List<Object> constants = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            bindProjected(evaluator, rows.get(i));
+            Object[] part = new Object[window.partition().size()];
+            for (int p = 0; p < part.length; p++) {
+                part[p] = evaluator.eval(window.partition().get(p));
+            }
+            Object[] keys = new Object[window.orderBy().size()];
+            for (int p = 0; p < keys.length; p++) {
+                keys[p] = evaluator.eval(window.orderBy().get(p).expr());
+            }
+            partitions.add(part);
+            ordering.add(keys);
+            Call call = window.call();
+            args.add(call.star() || call.args().isEmpty() ? null : evaluator.eval(call.args().get(0)));
+            if (i == 0) {
+                for (Expr arg : call.args()) {
+                    constants.add(evaluator.eval(arg));
+                }
+            }
+        }
+        return Windows.values(new WindowExpr(window.call(), window.partition(), window.orderBy(), window.frame(), constants),
+                partitions, ordering, args);
+    }
+
+    private void bindProjected(Evaluator evaluator, Projected projected) {
+        if (evaluator.joined() && projected.source != null) {
+            evaluator.bindJoined(projected.source);
+            return;
+        }
+        if (projected.row != null) {
+            evaluator.bind(projected.row);
+            return;
+        }
+        if (projected.source != null) {
+            evaluator.bindView(projected.source);
+        }
+    }
+
+    private DataType windowType(WindowExpr window, Schema schema) {
+        String name = window.call().name().toUpperCase(Locale.ROOT);
+        return switch (name) {
+            case "ROW_NUMBER", "RANK", "DENSE_RANK", "COUNT" -> DataType.BIGINT;
+            case "AVG" -> DataType.DOUBLE;
+            case "LAG", "LEAD", "SUM", "MIN", "MAX" -> window.call().args().isEmpty()
+                    ? DataType.BIGINT : infer(window.call().args().get(0), schema);
+            default -> throw new SeaException("unknown window function: " + window.call().name());
+        };
+    }
+
     private void createView(CreateView statement) {
         Relation rel = relation(statement.name());
         if (SystemTables.isSystem(rel.name())) {
@@ -6205,11 +9047,20 @@ final class Engine implements AutoCloseable {
         if (findTable(statement.name()) != null) {
             throw new SeaException("table already exists: " + shown(statement.name()));
         }
-        if (findView(statement.name()) != null) {
+        StoredView existingView = findView(statement.name());
+        if (existingView != null) {
+            if (statement.orReplace()) {
+                replaceView(existingView, statement);
+                return;
+            }
             if (statement.ifNotExists()) {
                 return;
             }
             throw new SeaException("view already exists: " + shown(statement.name()));
+        }
+        if (complexView(statement.source())) {
+            createComplexView(statement, stored);
+            return;
         }
         Select select = SqlParser.parseView(statement.source());
         if (relation(select.table()).key().equals(rel.key())) {
@@ -6251,6 +9102,61 @@ final class Engine implements AutoCloseable {
         recordOwner(stored);
     }
 
+    private boolean complexView(String source) {
+        try {
+            SqlParser.parseView(source);
+            return false;
+        } catch (SeaException exception) {
+            if ("view reads one table".equals(exception.getMessage())) {
+                return true;
+            }
+            throw exception;
+        }
+    }
+
+    private void createComplexView(CreateView statement, String stored) {
+        Query query = SqlParser.parseViewQuery(statement.source());
+        SqlResult preview = runQuery(query);
+        List<String> names = new ArrayList<>();
+        if (statement.columns().isEmpty()) {
+            for (ColumnMeta column : preview.columns()) {
+                names.add(column.name());
+            }
+        } else {
+            if (statement.columns().size() != preview.columns().size()) {
+                throw new SeaException("view column count does not match the SELECT");
+            }
+            names.addAll(statement.columns());
+        }
+        Set<String> used = new HashSet<>();
+        for (String column : names) {
+            Names.checkName(column, "column");
+            if (!used.add(Names.fold(column))) {
+                throw new SeaException("duplicate column in the view: " + column);
+            }
+        }
+        String joined = String.join(VIEW_COLUMN_SEPARATOR, names);
+        systemExecute("""
+                INSERT INTO SEA$VIEWS (
+                    SEA$VIEW_NAME, SEA$VIEW_SOURCE, SEA$RELATION_NAME, SEA$COLUMNS, SEA$OWNER_NAME
+                ) VALUES (?, ?, ?, ?, ?)
+                """, stored, statement.source(), viewRelation(query), joined, ownerName());
+        recordOwner(stored);
+    }
+
+    private String viewRelation(Query query) {
+        if (query instanceof Select select && select.table() != null) {
+            return storedRelationName(select.table());
+        }
+        if (query instanceof UnionQuery union) {
+            return viewRelation(union.left());
+        }
+        if (query instanceof WithQuery with) {
+            return viewRelation(with.body());
+        }
+        return "";
+    }
+
     private void dropView(DropView statement) {
         StoredView view = findView(statement.name());
         if (view == null) {
@@ -6265,9 +9171,252 @@ final class Engine implements AutoCloseable {
         forgetPrivileges(view.storedKey());
     }
 
+    private void replaceView(StoredView existing, CreateView statement) {
+        guardRoutine("the view", existing.name(), existing.owner(), null);
+        List<String> names = describeView(statement);
+        if (!sameOutput(existing.columns(), names)) {
+            throw new SeaException("view output columns changed: " + existing.name());
+        }
+        systemExecute("UPDATE SEA$VIEWS SET SEA$VIEW_SOURCE = ? WHERE SEA$VIEW_NAME = ?",
+                statement.source(), existing.storedKey());
+    }
+
+    private List<String> describeView(CreateView statement) {
+        if (complexView(statement.source())) {
+            SqlResult preview = runQuery(SqlParser.parseViewQuery(statement.source()));
+            if (statement.columns().isEmpty()) {
+                List<String> names = new ArrayList<>();
+                for (ColumnMeta column : preview.columns()) {
+                    names.add(column.name());
+                }
+                return names;
+            }
+            if (statement.columns().size() != preview.columns().size()) {
+                throw new SeaException("view column count does not match the SELECT");
+            }
+            return statement.columns();
+        }
+        Select select = SqlParser.parseView(statement.source());
+        Schema base = relationSchema(select.table());
+        List<SelectItem> items = viewItems(select, base);
+        if (statement.columns().isEmpty()) {
+            List<String> names = new ArrayList<>();
+            for (SelectItem item : items) {
+                names.add(item.label());
+            }
+            return names;
+        }
+        if (statement.columns().size() != items.size()) {
+            throw new SeaException("view column count does not match the SELECT");
+        }
+        return statement.columns();
+    }
+
+    private void replaceProcedure(StoredProcedure existing, CreateProcedure statement) {
+        guardRoutine("the procedure", existing.label(), existing.owner(), null);
+        List<ParamDef> outputs = parameters(existing.schema(), existing.name(), 1);
+        if (outputs.size() != statement.outputs().size()) {
+            throw new SeaException("procedure output columns changed: " + existing.label());
+        }
+        for (int i = 0; i < outputs.size(); i++) {
+            ParamDef before = outputs.get(i);
+            ParamDef after = statement.outputs().get(i);
+            if (!Names.same(before.name(), after.name()) || before.type() != after.type()) {
+                throw new SeaException("procedure output columns changed: " + existing.label());
+            }
+        }
+        List<ParamDef> inputs = parameters(existing.schema(), existing.name(), 0);
+        try {
+            systemExecute("""
+                    DELETE FROM SEA$PROCEDURE_PARAMETERS
+                    WHERE SEA$SCHEMA_NAME = ? AND SEA$PROCEDURE_NAME = ?
+                    """, existing.schema(), existing.name());
+            insertParameters(existing.schema(), existing.name(), statement.inputs(), 0);
+            insertParameters(existing.schema(), existing.name(), statement.outputs(), 1);
+            systemExecute("""
+                    UPDATE SEA$PROCEDURES SET SEA$PROCEDURE_SOURCE = ?
+                    WHERE SEA$SCHEMA_NAME = ? AND SEA$PROCEDURE_NAME = ?
+                    """, statement.source(), existing.schema(), existing.name());
+        } catch (RuntimeException exception) {
+            if (!inTransaction) {
+                systemExecute("""
+                        DELETE FROM SEA$PROCEDURE_PARAMETERS
+                        WHERE SEA$SCHEMA_NAME = ? AND SEA$PROCEDURE_NAME = ?
+                        """, existing.schema(), existing.name());
+                insertParameters(existing.schema(), existing.name(), inputs, 0);
+                insertParameters(existing.schema(), existing.name(), outputs, 1);
+            }
+            throw exception;
+        }
+    }
+
+    private boolean sameOutput(List<String> before, List<String> after) {
+        if (before.size() != after.size()) {
+            return false;
+        }
+        for (int i = 0; i < before.size(); i++) {
+            if (!Names.same(before.get(i), after.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void rejectView(String name) {
         if (findView(name) != null) {
             throw new SeaException("view is read-only: " + name);
+        }
+    }
+
+    private int insteadInsert(Insert statement, StoredView view) {
+        if (triggersFor(view.storedKey(), "INSTEAD OF", "INSERT").isEmpty()) {
+            throw new SeaException("view is read-only: " + statement.table());
+        }
+        Schema schema = viewWriteSchema(view);
+        List<Object[]> rows = incomingRows(statement, schema);
+        for (Object[] values : rows) {
+            fireInstead(view, schema, "INSERT", null, values);
+        }
+        return rows.size();
+    }
+
+    private int insteadUpdate(Update statement, StoredView view) {
+        if (triggersFor(view.storedKey(), "INSTEAD OF", "UPDATE").isEmpty()) {
+            throw new SeaException("view is read-only: " + statement.table());
+        }
+        Schema schema = viewWriteSchema(view);
+        SqlResult selected = query(new Select(false, true, List.of(), statement.table(), null, List.of(), statement.where(),
+                List.of(), null, List.of(), null, null));
+        int count = 0;
+        for (Row row : selected.rows()) {
+            Object[] old = rowValues(row);
+            Object[] neu = old.clone();
+            Evaluator evaluator = evaluator(null, null);
+            evaluator.useView(schema, schema.name);
+            evaluator.bindView(old);
+            for (Assignment assignment : statement.sets()) {
+                int index = schema.indexOf(assignment.column());
+                if (index < 0) {
+                    throw new SeaException("column not found: " + assignment.column());
+                }
+                neu[index] = prepared(schema, schema.columns.get(index), evaluator.eval(assignment.expr()));
+            }
+            fireInstead(view, schema, "UPDATE", old, neu);
+            count++;
+        }
+        return count;
+    }
+
+    private int insteadDelete(Delete statement, StoredView view) {
+        if (triggersFor(view.storedKey(), "INSTEAD OF", "DELETE").isEmpty()) {
+            throw new SeaException("view is read-only: " + statement.table());
+        }
+        Schema schema = viewWriteSchema(view);
+        SqlResult selected = query(new Select(false, true, List.of(), statement.table(), null, List.of(), statement.where(),
+                List.of(), null, List.of(), null, null));
+        for (Row row : selected.rows()) {
+            fireInstead(view, schema, "DELETE", rowValues(row), null);
+        }
+        return selected.size();
+    }
+
+    private Schema viewWriteSchema(StoredView view) {
+        try {
+            return new Schema(view.name(), viewOutputColumns(view), new int[0], List.of(), List.of());
+        } catch (SeaException exception) {
+            SqlResult preview = runQuery(SqlParser.parseViewQuery(view.source()));
+            return new Schema(view.name(), viewColumns(view, preview.columns()), new int[0], List.of(), List.of());
+        }
+    }
+
+    private void fireInstead(StoredView view, Schema schema, String event, Object[] oldValues, Object[] newValues) {
+        String previousPin = pinnedSchema;
+        pinnedSchema = view.schema();
+        try {
+            for (TriggerDef trigger : triggersFor(view.storedKey(), "INSTEAD OF", event)) {
+                Routine routine = SqlParser.parseRoutine(trigger.source);
+                RoutineScope local = new RoutineScope();
+                local.preferVariables = true;
+                local.bindRow(schema, newValues, oldValues);
+                for (ParamDef variable : routine.locals()) {
+                    local.declare(variable, null);
+                }
+                RoutineScope previousScope = scope;
+                Map<String, OpenCursor> previousCursors = cursors;
+                RoutineFrame previousFrame = frame;
+                boolean previousHalt = psqlHalt;
+                scope = local;
+                cursors = installCursors(routine);
+                frame = null;
+                psqlHalt = false;
+                enterRoutine();
+                try {
+                    runPsql(routine.body());
+                } finally {
+                    leaveRoutine();
+                    scope = previousScope;
+                    cursors = previousCursors;
+                    frame = previousFrame;
+                    psqlHalt = previousHalt;
+                }
+            }
+        } finally {
+            pinnedSchema = previousPin;
+        }
+    }
+
+    private void runBlock(PsqlBlock block) {
+        try {
+            for (Psql item : block.statements()) {
+                runPsql(item);
+                if (psqlHalt) {
+                    return;
+                }
+            }
+        } catch (SeaException exception) {
+            PsqlHandler handler = null;
+            for (PsqlHandler candidate : block.handlers()) {
+                if (candidate.any() || exception instanceof Raised) {
+                    handler = candidate;
+                    break;
+                }
+            }
+            if (handler == null) {
+                throw exception;
+            }
+            if (scope == null || !scope.hasVariable(handler.variable())) {
+                throw new SeaException("variable " + handler.variable() + " is not declared");
+            }
+            scope.setVariable(handler.variable(), exception.getMessage());
+            runPsql(handler.body());
+        }
+    }
+
+    private void executeDynamic(PsqlExecuteStatement statement) {
+        Object text = evalRoutine(statement.sql());
+        if (!(text instanceof String sql) || sql.isBlank()) {
+            throw new SeaException("EXECUTE STATEMENT expects text");
+        }
+        Object[] arguments = new Object[statement.arguments().size()];
+        for (int i = 0; i < arguments.length; i++) {
+            arguments[i] = evalRoutine(statement.arguments().get(i));
+        }
+        boolean previous = suppressCapture;
+        suppressCapture = true;
+        try {
+            SqlResult result = execute(actor, sql, arguments);
+            if (!statement.targets().isEmpty()) {
+                if (!result.isQuery() || result.size() != 1) {
+                    throw new SeaException("EXECUTE STATEMENT INTO expects one row");
+                }
+                assignFetched(statement.targets(), result.rows().get(0));
+                return;
+            }
+            if (scope != null) {
+                scope.rowCount = result.isQuery() ? result.size() : result.affectedRows();
+            }
+        } finally {
+            suppressCapture = previous;
         }
     }
 
@@ -6658,6 +9807,19 @@ final class Engine implements AutoCloseable {
         boolean hasColumn(String name);
     }
 
+    private record StoredDomain(String schema, String name, DataType type, int length, int scale,
+                                String defaultSource, String check, String owner) {
+    }
+
+    private record StoredFunction(String schema, String name, String source, DataType type, int length, int scale, String owner) {
+        String label() {
+            if (Names.same(schema, Relation.PUBLIC)) {
+                return name;
+            }
+            return schema + "." + name;
+        }
+    }
+
     private record StoredProcedure(String schema, String name, String source, String owner) {
         String label() {
             if (Names.same(schema, Relation.PUBLIC)) {
@@ -6679,7 +9841,16 @@ final class Engine implements AutoCloseable {
 
     private static final class EqualsProbe {
         final Map<Integer, Object> values = new LinkedHashMap<>();
+        final Map<String, Object> calls = new LinkedHashMap<>();
         boolean contradiction;
+        Integer rangeColumn;
+        Object low;
+        Object high;
+        boolean lowInclusive = true;
+        boolean highInclusive = true;
+        String likePrefix;
+        Integer orColumn;
+        List<Object> orValues;
     }
 
     private static final class RoutineFrame {
@@ -6687,6 +9858,7 @@ final class Engine implements AutoCloseable {
         private final boolean stopAtFirstSuspend;
         private final List<Object[]> rows = new ArrayList<>();
         private boolean suspended;
+        private Object returned;
 
         private RoutineFrame(List<ParamDef> outputs, boolean selectable) {
             this.outputs = outputs;
@@ -6700,6 +9872,216 @@ final class Engine implements AutoCloseable {
     private record ProcedureRows(String name, List<ParamDef> outputs, List<Object[]> rows) {
     }
 
+    private void pinRead(TableStore table) {
+        OpenTxn txn = currentTxn();
+        if (txn == null) {
+            return;
+        }
+        if (txn.readPin.containsKey(table)) {
+            return;
+        }
+        txn.readPin.put(table, table.capture());
+    }
+
+    private TableStore.Snapshot pinnedRead(TableStore table) {
+        if (!repeatable()) {
+            return null;
+        }
+        OpenTxn txn = currentTxn();
+        if (txn == null) {
+            return null;
+        }
+        return txn.readPin.get(table);
+    }
+
+    private boolean repeatable() {
+        return actor != null && (actor.isolation == 4 || actor.isolation == 8);
+    }
+
+    private TableStore.Snapshot uncommitted(TableStore table) {
+        if (actor == null || actor.isolation != 1) {
+            return null;
+        }
+        for (Map.Entry<Session, OpenTxn> entry : transactions.entrySet()) {
+            if (entry.getKey() == actor) {
+                continue;
+            }
+            TableStore.Snapshot workspace = entry.getValue().workspace.get(table);
+            if (workspace != null) {
+                return workspace;
+            }
+        }
+        return null;
+    }
+
+    private void lockRows(TableStore table, List<StoredRow> rows) {
+        if (!inTransaction || actor == null || SystemTables.isSystem(table.schema().name)) {
+            return;
+        }
+        if (actor.isolation == 1) {
+            return;
+        }
+        List<Long> ids = new ArrayList<>();
+        for (StoredRow row : rows) {
+            ids.add(row.id);
+        }
+        for (Long id : ids) {
+            Session holder = lockHolder(table, id);
+            if (holder == null || holder == actor) {
+                rowLocks.computeIfAbsent(table, key -> new HashMap<>()).put(id, actor);
+                continue;
+            }
+            int timeout = lockTimeoutSeconds();
+            long deadline = System.nanoTime() + timeout * 1_000_000_000L;
+            waiting.put(actor, holder);
+            try {
+                while (lockHolder(table, id) == holder) {
+                    if (waitsFor(holder, actor)) {
+                        throw new SeaException("deadlock");
+                    }
+                    long left = deadline - System.nanoTime();
+                    if (timeout == 0 || left <= 0) {
+                        throw new SeaException("lock timeout");
+                    }
+                    try {
+                        wait(Math.min(left / 1_000_000L, 200));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new SeaException("lock timeout");
+                    }
+                }
+            } finally {
+                waiting.remove(actor);
+            }
+            rowLocks.computeIfAbsent(table, key -> new HashMap<>()).put(id, actor);
+        }
+        notifyAll();
+    }
+
+    private Session lockHolder(TableStore table, long id) {
+        Map<Long, Session> locks = rowLocks.get(table);
+        return locks == null ? null : locks.get(id);
+    }
+
+    private boolean waitsFor(Session holder, Session me) {
+        Session cursor = waiting.get(holder);
+        int guard = 0;
+        while (cursor != null && guard++ < 64) {
+            if (cursor == me) {
+                return true;
+            }
+            cursor = waiting.get(cursor);
+        }
+        return false;
+    }
+
+    private void releaseLocks(Session session) {
+        for (Map<Long, Session> locks : rowLocks.values()) {
+            locks.entrySet().removeIf(entry -> entry.getValue() == session);
+        }
+        waiting.remove(session);
+        notifyAll();
+    }
+
+    private int lockTimeoutSeconds() {
+        for (TableStore table : tables.values()) {
+            if (!Names.same(table.schema().name, SystemTables.CONFIG)) {
+                continue;
+            }
+            for (StoredRow row : table.scan()) {
+                Object key = table.value(row, 0);
+                if (key != null && "lock.timeout".equalsIgnoreCase(String.valueOf(key))) {
+                    try {
+                        return Math.max(0, Integer.parseInt(String.valueOf(table.value(row, 1)).trim()));
+                    } catch (NumberFormatException exception) {
+                        return 10;
+                    }
+                }
+            }
+        }
+        return 10;
+    }
+
+    private void makeSavepoint(String name) {
+        Names.checkName(name, "savepoint");
+        OpenTxn txn = currentTxn();
+        if (txn == null) {
+            throw new SeaException("there is no open transaction");
+        }
+        txn.savepoints.removeIf(mark -> Names.same(mark.name, name));
+        SaveMark mark = new SaveMark(name, pending.size());
+        for (TableStore table : txn.tables.keySet()) {
+            if (!Names.same(table.schema().name, SystemTables.GENERATORS)) {
+                mark.rows.put(table, table.capture());
+            }
+        }
+        mark.created.putAll(txn.created);
+        mark.dropped.putAll(txn.dropped);
+        txn.savepoints.add(mark);
+    }
+
+    private void rollbackToSavepoint(String name) {
+        OpenTxn txn = currentTxn();
+        if (txn == null) {
+            throw new SeaException("there is no open transaction");
+        }
+        int at = -1;
+        for (int i = 0; i < txn.savepoints.size(); i++) {
+            if (Names.same(txn.savepoints.get(i).name, name)) {
+                at = i;
+            }
+        }
+        if (at < 0) {
+            throw new SeaException("savepoint not found: " + name);
+        }
+        SaveMark mark = txn.savepoints.get(at);
+        for (TableStore table : List.copyOf(txn.created.keySet())) {
+            if (!mark.created.containsKey(table)) {
+                txn.created.remove(table);
+                txn.tables.remove(table);
+                if (tables.containsValue(table)) {
+                    discardTable(table);
+                }
+            }
+        }
+        for (Map.Entry<String, TableStore> entry : List.copyOf(txn.dropped.entrySet())) {
+            if (!mark.dropped.containsKey(entry.getKey())) {
+                tables.put(entry.getKey(), entry.getValue());
+                txn.dropped.remove(entry.getKey());
+            }
+        }
+        for (Map.Entry<TableStore, TableStore.Snapshot> entry : mark.rows.entrySet()) {
+            if (entry.getKey().schema() != null) {
+                entry.getKey().restore(entry.getValue());
+            }
+        }
+        if (pending.size() > mark.pendingSize) {
+            pending.subList(mark.pendingSize, pending.size()).clear();
+        }
+        while (txn.savepoints.size() > at + 1) {
+            txn.savepoints.remove(txn.savepoints.size() - 1);
+        }
+    }
+
+    private void releaseSavepoint(String name) {
+        OpenTxn txn = currentTxn();
+        if (txn == null) {
+            throw new SeaException("there is no open transaction");
+        }
+        int at = -1;
+        for (int i = 0; i < txn.savepoints.size(); i++) {
+            if (Names.same(txn.savepoints.get(i).name, name)) {
+                at = i;
+            }
+        }
+        if (at < 0) {
+            throw new SeaException("savepoint not found: " + name);
+        }
+        while (txn.savepoints.size() > at) {
+            txn.savepoints.remove(txn.savepoints.size() - 1);
+        }
+    }
+
     private void track(TableStore table) {
         Session owner = transactionSession != null ? transactionSession : actor;
         if (owner == null) {
@@ -6709,6 +10091,7 @@ final class Engine implements AutoCloseable {
         if (txn == null || txn.tables.containsKey(table)) {
             return;
         }
+        table.materializeDirectory();
         table.markShared();
         TableStore.Snapshot layout = table.savepoint();
         txn.layout.put(table, layout);
@@ -6774,7 +10157,11 @@ final class Engine implements AutoCloseable {
         for (TableStore table : txn.tables.keySet()) {
             long next = table.nextRowId();
             Schema schema = table.schema();
-            txn.workspace.put(table, table.savepoint());
+            TableStore.Snapshot shot = table.savepoint();
+            if (session.isolation == 4 || session.isolation == 8) {
+                shot = table.pin(shot);
+            }
+            txn.workspace.put(table, shot);
             TableStore.Snapshot back = txn.held.remove(table);
             if (back == null) {
                 back = txn.layout.get(table);
@@ -6789,6 +10176,8 @@ final class Engine implements AutoCloseable {
 
     private void rollbackSession(Session session) {
         pending.clear();
+        undoRenames(0);
+        releaseLocks(session);
         OpenTxn txn = transactions.remove(session);
         if (txn == null) {
             throw new SeaException("there is no open transaction");
@@ -7636,6 +11025,8 @@ final class Engine implements AutoCloseable {
         } finally {
             commitMarker = null;
         }
+        releaseLocks(owner);
+        renameUndo.clear();
         transactions.remove(owner);
         installed = null;
         inTransaction = false;
@@ -7704,12 +11095,27 @@ final class Engine implements AutoCloseable {
         private final IdentityHashMap<TableStore, Boolean> tables = new IdentityHashMap<>();
         private final IdentityHashMap<TableStore, Boolean> created = new IdentityHashMap<>();
         private final LinkedHashMap<String, TableStore> dropped = new LinkedHashMap<>();
+        private final List<SaveMark> savepoints = new ArrayList<>();
+        private final IdentityHashMap<TableStore, TableStore.Snapshot> readPin = new IdentityHashMap<>();
 
         private boolean hardened;
         private TransactionLog.TxnUndo hardenedImage;
 
         private OpenTxn(long id) {
             this.id = id;
+        }
+    }
+
+    private static final class SaveMark {
+        private final String name;
+        private final IdentityHashMap<TableStore, TableStore.Snapshot> rows = new IdentityHashMap<>();
+        private final IdentityHashMap<TableStore, Boolean> created = new IdentityHashMap<>();
+        private final LinkedHashMap<String, TableStore> dropped = new LinkedHashMap<>();
+        private final int pendingSize;
+
+        private SaveMark(String name, int pendingSize) {
+            this.name = name;
+            this.pendingSize = pendingSize;
         }
     }
 

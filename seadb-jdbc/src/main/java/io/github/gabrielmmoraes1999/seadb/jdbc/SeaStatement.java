@@ -21,6 +21,7 @@ class SeaStatement implements Statement {
     private final List<String> batch = new ArrayList<>();
     private SeaResultSet result;
     private int updateCount = -1;
+    SqlResult generated;
     private int maxRows;
     private int maxFieldSize;
     private int queryTimeout;
@@ -123,7 +124,8 @@ class SeaStatement implements Statement {
     }
 
     @Override
-    public void cancel() {
+    public void cancel() throws SQLException {
+        connection.cancel();
     }
 
     @Override
@@ -270,7 +272,10 @@ class SeaStatement implements Statement {
     @Override
     public ResultSet getGeneratedKeys() throws SQLException {
         checkOpen();
-        return SeaResultSet.metadata(List.of(JdbcColumn.bigint("GENERATED_KEY")), List.of());
+        if (generated == null || generated.generatedColumns().isEmpty()) {
+            return SeaResultSet.metadata(List.of(JdbcColumn.bigint("GENERATED_KEY")), List.of());
+        }
+        return SeaResultSet.query(this, SqlResult.query(generated.generatedColumns(), generated.generatedRows()), 0);
     }
 
     @Override
@@ -357,7 +362,9 @@ class SeaStatement implements Statement {
             closeResult();
             updateCount = -1;
             connection.beforeStatement(sql);
-            SqlResult outcome = connection.execute(sql, params);
+            int window = fetchSize > 0 ? fetchSize : 64;
+            SqlResult outcome = connection.execute(sql, params, window, queryTimeout);
+            generated = outcome;
             if (outcome.isQuery()) {
                 result = SeaResultSet.query(this, outcome, maxRows);
                 return true;

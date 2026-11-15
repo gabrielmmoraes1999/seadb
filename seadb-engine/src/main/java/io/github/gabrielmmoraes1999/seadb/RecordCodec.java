@@ -155,13 +155,15 @@ final class RecordCodec {
 
     private static int maxFieldSize(Column column) {
         return switch (column.type) {
-            case BIGINT, DOUBLE, TIMESTAMP -> 8;
+            case BIGINT, DOUBLE, TIMESTAMP, INTERVAL -> 8;
             case INTEGER, FLOAT, DATE, TIME -> 4;
             case SMALLINT -> 2;
             case BOOLEAN -> 1;
             case DECIMAL -> decimalWidth(column.length);
             case CHAR, VARCHAR -> column.heapBacked() ? 16 : 2 + column.length * 4;
-            case BLOB -> 16;
+            case UUID -> 16;
+            case TIMESTAMPTZ -> 10;
+            case JSON, BLOB -> 16;
         };
     }
 
@@ -202,6 +204,18 @@ final class RecordCodec {
             case TIME -> buffer.putInt(timeMillis((LocalTime) cell.value));
             case TIMESTAMP -> buffer.putLong(((LocalDateTime) cell.value).toInstant(ZoneOffset.UTC).toEpochMilli());
             case DECIMAL -> writeDecimal(buffer, (BigDecimal) cell.value, column.length);
+            case UUID -> {
+                java.util.UUID id = (java.util.UUID) cell.value;
+                buffer.putLong(id.getMostSignificantBits());
+                buffer.putLong(id.getLeastSignificantBits());
+            }
+            case INTERVAL -> buffer.putLong(((SqlInterval) cell.value).millis);
+            case TIMESTAMPTZ -> {
+                java.time.OffsetDateTime stamp = (java.time.OffsetDateTime) cell.value;
+                buffer.putLong(stamp.toInstant().toEpochMilli());
+                buffer.putShort((short) (stamp.getOffset().getTotalSeconds() / 60));
+            }
+            case JSON -> writeRef(buffer, cell);
             case CHAR, VARCHAR -> {
                 if (column.heapBacked()) {
                     writeRef(buffer, cell);
@@ -231,6 +245,15 @@ final class RecordCodec {
             case DATE -> new Cell(LocalDate.ofEpochDay(buffer.getInt()), -1, 0);
             case TIMESTAMP -> new Cell(LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(buffer.getLong()), ZoneOffset.UTC), -1, 0);
             case DECIMAL -> new Cell(readDecimal(buffer, column.length, column.scale), -1, 0);
+            case UUID -> new Cell(new java.util.UUID(buffer.getLong(), buffer.getLong()), -1, 0);
+            case INTERVAL -> new Cell(new SqlInterval(buffer.getLong()), -1, 0);
+            case TIMESTAMPTZ -> {
+                long epoch = buffer.getLong();
+                short minutes = buffer.getShort();
+                yield new Cell(java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochMilli(epoch),
+                        java.time.ZoneOffset.ofTotalSeconds(minutes * 60)), -1, 0);
+            }
+            case JSON -> readRef(column, buffer);
             case CHAR, VARCHAR -> column.heapBacked()
                     ? readRef(column, buffer)
                     : new Cell(readInlineText(buffer, column), -1, 0);

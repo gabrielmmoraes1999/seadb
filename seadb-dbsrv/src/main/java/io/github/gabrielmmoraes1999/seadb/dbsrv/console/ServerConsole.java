@@ -250,7 +250,8 @@ public final class ServerConsole extends JFrame {
             if (arguments.databases().isEmpty()) {
                 server = MotorServer.listen(host, port, log, arguments.cacheBytes());
             } else {
-                server = MotorServer.start(new MotorConfig(host, port, arguments.databases()), log, arguments.cacheBytes());
+                server = MotorServer.start(new MotorConfig(host, port, arguments.databases(),
+                        arguments.sslKeystore(), arguments.sslPassword()), log, arguments.cacheBytes());
             }
             if (shuttingDown) {
                 server.close();

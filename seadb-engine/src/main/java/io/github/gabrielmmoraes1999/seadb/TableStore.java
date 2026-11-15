@@ -28,6 +28,9 @@ final class TableStore implements AutoCloseable {
     private Schema schema;
     private String namespace = Relation.PUBLIC;
     private RowMap rows = new RowMap();
+    /** Committed slots. Absent from {@link #rows} until a transaction changes the row. */
+    private final TreeMap<Long, LiveSlot> directory = new TreeMap<>();
+    private StoredRow.Loader slotReader;
     private List<Extent> freeExtents = new ArrayList<>();
     private List<Extent> pendingFree = new ArrayList<>();
     private long fileSize;
@@ -126,7 +129,105 @@ final class TableStore implements AutoCloseable {
     }
 
     List<StoredRow> scan() {
-        return new ArrayList<>(rows.values());
+        Pace.check();
+        return new ArrayList<>(visible().values());
+    }
+
+    private TreeMap<Long, StoredRow> visible() {
+        TreeMap<Long, StoredRow> all = new TreeMap<>();
+        for (LiveSlot slot : directory.values()) {
+            Pace.check();
+            if (rows.hidden(slot.rowId)) {
+                continue;
+            }
+            StoredRow over = rows.get(slot.rowId);
+            all.put(slot.rowId, over != null ? over : materialize(slot));
+        }
+        for (StoredRow row : rows.values()) {
+            all.putIfAbsent(row.id, row);
+        }
+        return all;
+    }
+
+    private StoredRow resolve(long id) {
+        if (rows.hidden(id)) {
+            return null;
+        }
+        StoredRow over = rows.get(id);
+        if (over != null) {
+            return over;
+        }
+        LiveSlot slot = directory.get(id);
+        return slot == null ? null : materialize(slot);
+    }
+
+    private StoredRow materialize(LiveSlot slot) {
+        if (slotReader == null) {
+            slotReader = new SlotReader(schema);
+        }
+        return new StoredRow(slot.rowId, slot.offset, slot.size, slotReader);
+    }
+
+    private boolean anyRow() {
+        for (LiveSlot slot : directory.values()) {
+            if (!rows.hidden(slot.rowId)) {
+                return true;
+            }
+        }
+        return !rows.isEmpty();
+    }
+
+    private void adoptAll(TreeMap<Long, StoredRow> next) {
+        directory.clear();
+        rows = RowMap.adopt(next);
+    }
+
+    /** Copies the on-disk directory into the row map before a transaction snapshots it. */
+    void materializeDirectory() {
+        if (directory.isEmpty()) {
+            return;
+        }
+        adoptAll(visible());
+    }
+
+    /** One pass over the live rows. Null keys are omitted, the same way the index omits them. */
+    List<IndexCensus> census(long[] rowCount) {
+        long counted = 0;
+        long[] entries = new long[indexes.size()];
+        Object[] min = new Object[indexes.size()];
+        Object[] max = new Object[indexes.size()];
+        boolean[] seen = new boolean[indexes.size()];
+        for (StoredRow row : scan()) {
+            counted++;
+            for (int i = 0; i < indexes.size(); i++) {
+                Object[] key = keyParts(schema, indexes.get(i), row);
+                if (key == null || key.length == 0 || key[0] == null) {
+                    continue;
+                }
+                entries[i]++;
+                if (!seen[i] || Values.compare(key[0], min[i]) < 0) {
+                    min[i] = key[0];
+                }
+                if (!seen[i] || Values.compare(key[0], max[i]) > 0) {
+                    max[i] = key[0];
+                }
+                seen[i] = true;
+            }
+        }
+        rowCount[0] = counted;
+        List<IndexCensus> census = new ArrayList<>();
+        for (int i = 0; i < indexes.size(); i++) {
+            census.add(new IndexCensus(indexes.get(i).name, entries[i], boundText(min[i]), boundText(max[i])));
+        }
+        return census;
+    }
+
+    private static String boundText(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String text = value instanceof java.math.BigDecimal decimal ? decimal.toPlainString() : String.valueOf(value);
+        return text.length() > 256 ? text.substring(0, 256) : text;
     }
 
     RowMap rowMap() {
@@ -153,7 +254,7 @@ final class TableStore implements AutoCloseable {
         for (int i = 0; i < raw.length; i++) {
             cells[i] = toCell(schema.columns.get(i), raw[i]);
         }
-        if (rows.containsKey(id)) {
+        if (resolve(id) != null) {
             update(java.util.Map.of(id, cells));
             return;
         }
@@ -169,7 +270,7 @@ final class TableStore implements AutoCloseable {
     }
 
     StoredRow row(long id) {
-        return rows.get(id);
+        return resolve(id);
     }
 
     boolean hasIndex(String name) {
@@ -185,11 +286,25 @@ final class TableStore implements AutoCloseable {
     }
 
     void createIndex(String name, int[] columns, boolean unique) {
-        rejectBlobKey(schema, columns);
-        Schema next = schema.withIndex(new IndexDef(name, columns, unique));
+        createIndex(name, columns, unique, false);
+    }
+
+    void createIndex(String name, int[] columns, boolean unique, boolean descending) {
+        createIndex(new IndexDef(name, columns, unique, descending));
+    }
+
+    void createIndex(IndexDef definition) {
+        rejectBlobKey(schema, definition.columns);
+        for (int column : definition.include) {
+            if (schema.columns.get(column).type == DataType.BLOB) {
+                throw new SeaException("BLOB cannot be included in an index");
+            }
+        }
+        Schema next = schema.withIndex(definition);
         validate(next);
-        IndexTree.DiskIndex created = IndexTree.DiskIndex.empty(new IndexTree.Spec(name, columns, false, unique))
-                .fill(schema, rows.values(), this::keyParts, new ArrayList<>(), pages());
+        IndexTree.DiskIndex created = IndexTree.DiskIndex.empty(new IndexTree.Spec(definition.name, definition.columns,
+                        false, definition.unique, definition.predicate, definition.expressions, definition.include))
+                .fill(schema, visible().values(), indexReader(), new ArrayList<>(), pages());
         schema = next;
         List<IndexTree.DiskIndex> copy = new ArrayList<>(indexes);
         copy.add(created);
@@ -214,7 +329,7 @@ final class TableStore implements AutoCloseable {
         validate(next);
         List<Extent> extra = new ArrayList<>();
         IndexTree.DiskIndex created = IndexTree.DiskIndex.empty(new IndexTree.Spec(key.name, key.columns, false, true))
-                .fill(next, rows.values(), this::keyParts, extra, pages());
+                .fill(next, visible().values(), indexReader(), extra, pages());
         int at = (schema.primaryKey.length > 0 ? 1 : 0) + schema.uniques.size();
         List<IndexTree.DiskIndex> copy = new ArrayList<>();
         copy.addAll(indexes.subList(0, at));
@@ -309,28 +424,28 @@ final class TableStore implements AutoCloseable {
     }
 
     List<StoredRow> lookup(Map<Integer, Object> equals) {
-        if (equals.isEmpty()) {
+        return lookup(equals, null, Map.of());
+    }
+
+    List<StoredRow> lookup(Map<Integer, Object> equals, Expr where, Map<String, Object> calls) {
+        if ((equals == null || equals.isEmpty()) && (calls == null || calls.isEmpty())) {
             return null;
         }
-        IndexTree.DiskIndex best = chooseIndex(equals);
+        IndexTree.DiskIndex best = chooseIndex(equals, where, calls);
         if (best == null) {
             return null;
         }
-        int prefix = best.prefixLength(equals);
-        Object[] parts = new Object[prefix];
-        for (int i = 0; i < prefix; i++) {
-            Object value = equals.get(best.columns[i]);
-            if (value == null) {
-                return List.of();
-            }
-            parts[i] = value;
+        int prefix = best.prefixLength(equals, calls);
+        Object[] parts = keyProbe(best, prefix, equals, calls);
+        if (parts == null) {
+            return List.of();
         }
         List<Long> ids = prefix == best.columns.length
                 ? best.find(schema, parts, pages())
                 : best.findPrefix(schema, prefix, parts, pages());
         List<StoredRow> found = new ArrayList<>();
         for (Long id : ids) {
-            StoredRow row = rows.get(id);
+            StoredRow row = resolve(id);
             if (row != null) {
                 found.add(row);
             }
@@ -339,11 +454,207 @@ final class TableStore implements AutoCloseable {
         return found;
     }
 
+    /**
+     * Rows answered from the index leaf when every requested column is a key or an INCLUDE column.
+     * Returns null when the index cannot cover the request.
+     */
+    List<StoredRow> cover(Map<Integer, Object> equals, Expr where, Map<String, Object> calls, Set<Integer> needed) {
+        if (needed == null || needed.isEmpty()) {
+            return null;
+        }
+        IndexTree.DiskIndex best = null;
+        int prefix = 0;
+        Map<Integer, Object> keys = equals == null ? Map.of() : equals;
+        for (IndexTree.DiskIndex index : indexes) {
+            if (index.include.length == 0 || !index.eligible(where, schema)) {
+                continue;
+            }
+            int candidate = index.prefixLength(keys, calls);
+            if (candidate == 0) {
+                continue;
+            }
+            boolean fits = true;
+            for (int column : needed) {
+                if (!coveredColumn(index, column, candidate)) {
+                    fits = false;
+                    break;
+                }
+            }
+            if (fits && (best == null || candidate > prefix)) {
+                best = index;
+                prefix = candidate;
+            }
+        }
+        if (best == null) {
+            return null;
+        }
+        Object[] parts = keyProbe(best, prefix, equals, calls);
+        if (parts == null) {
+            return List.of();
+        }
+        List<IndexTree.CoverHit> hits = prefix == best.columns.length
+                ? best.findCovered(schema, parts, pages())
+                : best.findCoveredPrefix(schema, prefix, parts, pages());
+        List<StoredRow> found = new ArrayList<>();
+        for (IndexTree.CoverHit hit : hits) {
+            Cell[] cells = new Cell[schema.columns.size()];
+            for (int i = 0; i < cells.length; i++) {
+                cells[i] = Cell.sqlNull();
+            }
+            for (int i = 0; i < prefix; i++) {
+                if (!best.expressionAt(i)) {
+                    cells[best.columns[i]] = toCell(schema.columns.get(best.columns[i]), parts[i]);
+                }
+            }
+            if (hit.included() != null) {
+                for (int i = 0; i < best.include.length && i < hit.included().length; i++) {
+                    cells[best.include[i]] = toCell(schema.columns.get(best.include[i]), hit.included()[i]);
+                }
+            }
+            found.add(new StoredRow(hit.id(), cells, -1, 0, false));
+        }
+        found.sort((left, right) -> Long.compare(left.id, right.id));
+        return found;
+    }
+
+    private boolean coveredColumn(IndexTree.DiskIndex index, int column, int prefix) {
+        for (int i = 0; i < prefix; i++) {
+            if (!index.expressionAt(i) && index.columns[i] == column) {
+                return true;
+            }
+        }
+        for (int included : index.include) {
+            if (included == column) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Object[] keyProbe(IndexTree.DiskIndex index, int prefix, Map<Integer, Object> equals, Map<String, Object> calls) {
+        Object[] parts = new Object[prefix];
+        for (int i = 0; i < prefix; i++) {
+            Object value;
+            if (index.expressionAt(i)) {
+                value = calls.get(index.canon[i]);
+            } else {
+                value = equals.get(index.columns[i]);
+            }
+            if (value == null) {
+                return null;
+            }
+            Column column = schema.columns.get(index.columns[i]);
+            parts[i] = Values.coerce(column.type, column.length, column.scale, value);
+        }
+        return parts;
+    }
+
+    /**
+     * Rows from an index leaf range. Returns null when no index serves the bounds.
+     * A descending index yields the ids in descending key order.
+     */
+    List<StoredRow> lookupRange(Map<Integer, Object> equals, int rangeColumn, Object low, boolean lowInclusive,
+                                Object high, boolean highInclusive, String likePrefix) {
+        return lookupRange(equals, rangeColumn, low, lowInclusive, high, highInclusive, likePrefix, null, Map.of(), null);
+    }
+
+    List<StoredRow> lookupRange(Map<Integer, Object> equals, int rangeColumn, Object low, boolean lowInclusive,
+                                Object high, boolean highInclusive, String likePrefix, Expr where,
+                                Map<String, Object> calls) {
+        return lookupRange(equals, rangeColumn, low, lowInclusive, high, highInclusive, likePrefix, where, calls, null);
+    }
+
+    List<StoredRow> lookupRange(Map<Integer, Object> equals, int rangeColumn, Object low, boolean lowInclusive,
+                                Object high, boolean highInclusive, String likePrefix, Expr where,
+                                Map<String, Object> calls, Map<String, IndexStat> stats) {
+        IndexTree.DiskIndex best = null;
+        int bestPrefix = -1;
+        for (IndexTree.DiskIndex index : indexes) {
+            if (!index.eligible(where, schema)) {
+                continue;
+            }
+            int prefix = index.prefixLength(equals == null ? Map.of() : equals, calls);
+            if (prefix >= index.columns.length || index.expressionAt(prefix) || index.columns[prefix] != rangeColumn) {
+                continue;
+            }
+            if (prefix > bestPrefix) {
+                best = index;
+                bestPrefix = prefix;
+            }
+        }
+        if (best == null) {
+            return null;
+        }
+        if (stats != null) {
+            IndexStat stat = stats.get(Names.fold(best.name));
+            if (stat != null && IndexFeatures.wideRange(schema, best, bestPrefix, low, high, likePrefix,
+                    stat.rows(), stat.entries(), stat.min(), stat.max())) {
+                return null;
+            }
+        }
+        Object[] leading = new Object[bestPrefix];
+        for (int i = 0; i < bestPrefix; i++) {
+            leading[i] = equals.get(best.columns[i]);
+            if (leading[i] == null) {
+                return List.of();
+            }
+        }
+        List<Long> ids;
+        if (likePrefix != null) {
+            ids = best.findLikePrefix(schema, leading, likePrefix, pages());
+        } else {
+            Object[] lowKey = low == null ? null : java.util.Arrays.copyOf(leading, bestPrefix + 1);
+            Object[] highKey = high == null ? null : java.util.Arrays.copyOf(leading, bestPrefix + 1);
+            if (lowKey != null) {
+                lowKey[bestPrefix] = low;
+            }
+            if (highKey != null) {
+                highKey[bestPrefix] = high;
+            }
+            if (lowKey == null && highKey == null) {
+                return null;
+            }
+            int width = bestPrefix + 1;
+            ids = best.findRange(schema, width, lowKey, low == null || lowInclusive, highKey, high == null || highInclusive, pages());
+        }
+        if (indexDescending(best.name)) {
+            java.util.Collections.reverse(ids);
+        }
+        List<StoredRow> found = new ArrayList<>();
+        for (Long id : ids) {
+            StoredRow row = resolve(id);
+            if (row != null) {
+                found.add(row);
+            }
+        }
+        return found;
+    }
+
+    private boolean indexDescending(String name) {
+        for (IndexDef index : schema.indexes) {
+            if (Names.same(index.name, name)) {
+                return index.descending;
+            }
+        }
+        if (schema.primaryIndex != null && Names.same(schema.primaryIndex, name)) {
+            return schema.primaryDescending;
+        }
+        return false;
+    }
+
     private IndexTree.DiskIndex chooseIndex(Map<Integer, Object> equals) {
+        return chooseIndex(equals, null, Map.of());
+    }
+
+    private IndexTree.DiskIndex chooseIndex(Map<Integer, Object> equals, Expr where, Map<String, Object> calls) {
         IndexTree.DiskIndex best = null;
         int bestPrefix = 0;
+        Map<Integer, Object> keys = equals == null ? Map.of() : equals;
         for (IndexTree.DiskIndex index : indexes) {
-            int prefix = index.prefixLength(equals);
+            if (!index.eligible(where, schema)) {
+                continue;
+            }
+            int prefix = index.prefixLength(keys, calls);
             if (prefix == 0) {
                 continue;
             }
@@ -355,6 +666,23 @@ final class TableStore implements AutoCloseable {
             }
         }
         return best;
+    }
+
+    String explainIndex(Map<Integer, Object> equals, Expr where, Map<String, Object> calls) {
+        IndexTree.DiskIndex index = chooseIndex(equals, where, calls);
+        if (index == null) {
+            return null;
+        }
+        StringBuilder keys = new StringBuilder();
+        int prefix = index.prefixLength(equals == null ? Map.of() : equals, calls);
+        int shown = Math.max(prefix, 1);
+        for (int i = 0; i < shown && i < index.columns.length; i++) {
+            if (i > 0) {
+                keys.append(", ");
+            }
+            keys.append(schema.columns.get(index.columns[i]).name);
+        }
+        return "index " + index.name + " (" + keys + ")";
     }
 
     Object value(StoredRow row, int index) {
@@ -419,11 +747,10 @@ final class TableStore implements AutoCloseable {
         noteStructure();
         unshare();
         Schema nextSchema = schema;
-        TreeMap<Long, StoredRow> next = rows.tree();
         List<Extent> freed = new ArrayList<>();
         List<Extent> extra = new ArrayList<>();
         for (Map.Entry<Long, Cell[]> entry : replacements.entrySet()) {
-            StoredRow current = rows.get(entry.getKey());
+            StoredRow current = resolve(entry.getKey());
             if (current == null) {
                 throw new SeaException("record not found for update");
             }
@@ -444,13 +771,27 @@ final class TableStore implements AutoCloseable {
             freed.addAll(freedExtents(current, cells));
             StoredRow replacement = new StoredRow(current.id, cells, -1, 0, true);
             reindex(schema, current, nextSchema, replacement, extra);
-            next.put(current.id, replacement);
+            rows.put(current.id, replacement);
         }
         schema = nextSchema;
-        rows = RowMap.adopt(next);
         pendingFree.addAll(freed);
         pendingFree.addAll(extra);
         dirty = true;
+    }
+
+    int deleteAll() {
+        List<Long> ids = new ArrayList<>();
+        for (StoredRow row : scan()) {
+            ids.add(row.id);
+        }
+        int count = delete(ids);
+        for (int i = 0; i < schema.columns.size(); i++) {
+            if (schema.columns.get(i).autoIncrement) {
+                schema = schema.withIdentity(i, 1);
+            }
+        }
+        dirty = true;
+        return count;
     }
 
     int delete(Collection<Long> ids) {
@@ -459,20 +800,19 @@ final class TableStore implements AutoCloseable {
         }
         noteStructure();
         unshare();
-        TreeMap<Long, StoredRow> next = rows.tree();
         List<Extent> freed = new ArrayList<>();
         List<Extent> extra = new ArrayList<>();
         int count = 0;
         for (Long id : ids) {
-            StoredRow current = next.remove(id);
+            StoredRow current = resolve(id);
             if (current == null) {
                 continue;
             }
             unindex(current, extra);
             freed.addAll(freedExtents(current, null));
+            rows.hide(id);
             count++;
         }
-        rows = RowMap.adopt(next);
         pendingFree.addAll(freed);
         pendingFree.addAll(extra);
         dirty = true;
@@ -487,18 +827,18 @@ final class TableStore implements AutoCloseable {
         if ((primary || uniqueName != null) && column.type == DataType.BLOB) {
             throw new SeaException("BLOB cannot be a key");
         }
-        if (!rows.isEmpty() && column.notNull && !column.hasDefault && !column.autoIncrement) {
+        if (anyRow() && column.notNull && !column.hasDefault && !column.autoIncrement) {
             throw new SeaException("NOT NULL column requires a DEFAULT when the table already has records");
         }
         Column stored = column.autoIncrement && column.nextIdentity == 0 ? column.withIdentity(1) : column;
         long identity = stored.nextIdentity;
         TreeMap<Long, StoredRow> next = new TreeMap<>();
         List<Extent> freed = new ArrayList<>();
-        for (StoredRow current : rows.values()) {
+        for (StoredRow current : visible().values()) {
             Cell[] cells = new Cell[current.cells().length + 1];
             System.arraycopy(current.cells(), 0, cells, 0, current.cells().length);
             Object value = null;
-            if (!rows.isEmpty() && stored.autoIncrement && !stored.hasDefault) {
+            if (anyRow() && stored.autoIncrement && !stored.hasDefault) {
                 value = identity++;
             } else if (stored.hasDefault) {
                 value = stored.defaultValue;
@@ -518,7 +858,59 @@ final class TableStore implements AutoCloseable {
         indexes = indexesAfterAdd(nextSchema, next, primary);
         schema = nextSchema;
         rows = RowMap.adopt(next);
+        directory.clear();
         pendingFree.addAll(freed);
+        dirty = true;
+    }
+
+    /** Replaces the schema and rewrites every stored value. A failed conversion leaves the table untouched. */
+    void installSchema(Schema next) {
+        noteStructure();
+        if (next.columns.size() != schema.columns.size()) {
+            throw new SeaException("column count changed");
+        }
+        List<Cell[]> converted = new ArrayList<>();
+        List<Long> ids = new ArrayList<>();
+        List<Extent> freed = new ArrayList<>();
+        for (StoredRow current : visible().values()) {
+            Cell[] cells = new Cell[next.columns.size()];
+            for (int i = 0; i < cells.length; i++) {
+                Object value = logical(current.cells()[i], schema.columns.get(i));
+                Column column = next.columns.get(i);
+                if (value != null && (column.type != schema.columns.get(i).type
+                        || column.length != schema.columns.get(i).length
+                        || column.scale != schema.columns.get(i).scale)) {
+                    value = Values.coerce(column.type, column.length, column.scale, value);
+                }
+                if (value == null && column.notNull) {
+                    throw new SeaException("required column has no value: " + column.name);
+                }
+                cells[i] = toCell(column, value);
+            }
+            converted.add(cells);
+            ids.add(current.id);
+        }
+        TreeMap<Long, StoredRow> rewritten = new TreeMap<>();
+        for (int i = 0; i < ids.size(); i++) {
+            StoredRow current = resolve(ids.get(i));
+            freed.addAll(freedExtents(current, converted.get(i)));
+            rewritten.put(ids.get(i), new StoredRow(ids.get(i), converted.get(i), -1, 0, true));
+        }
+        validate(next);
+        List<Extent> extra = new ArrayList<>();
+        for (IndexTree.DiskIndex index : indexes) {
+            index.release(extra, pages());
+        }
+        List<IndexTree.DiskIndex> nextIndexes = new ArrayList<>();
+        for (IndexTree.Spec spec : IndexTree.specs(next)) {
+            nextIndexes.add(IndexTree.DiskIndex.empty(spec).fill(next, rewritten.values(), indexReader(), extra, pages()));
+        }
+        schema = next;
+        indexes = nextIndexes;
+        rows = RowMap.adopt(rewritten);
+        directory.clear();
+        pendingFree.addAll(freed);
+        pendingFree.addAll(extra);
         dirty = true;
     }
 
@@ -528,7 +920,7 @@ final class TableStore implements AutoCloseable {
         }
         List<Extent> extra = new ArrayList<>();
         IndexTree.DiskIndex primary = IndexTree.DiskIndex.empty(new IndexTree.Spec(index, columns, true, true))
-                .fill(schema, rows.values(), this::keyParts, extra, pages());
+                .fill(schema, visible().values(), indexReader(), extra, pages());
         Schema nextSchema = schema.withPrimaryKey(columns, constraint, index, descending);
         validate(nextSchema);
         List<IndexTree.DiskIndex> copy = new ArrayList<>();
@@ -548,7 +940,7 @@ final class TableStore implements AutoCloseable {
         Schema next = schema.withIndex(new IndexDef(key.indexName, key.columns, false, key.descending)).withForeignKey(key);
         validate(next);
         IndexTree.DiskIndex created = IndexTree.DiskIndex.empty(new IndexTree.Spec(key.indexName, key.columns, false, false))
-                .fill(schema, rows.values(), this::keyParts, new ArrayList<>(), pages());
+                .fill(schema, visible().values(), indexReader(), new ArrayList<>(), pages());
         schema = next;
         List<IndexTree.DiskIndex> copy = new ArrayList<>(indexes);
         copy.add(created);
@@ -577,7 +969,7 @@ final class TableStore implements AutoCloseable {
         validate(nextSchema);
         TreeMap<Long, StoredRow> next = new TreeMap<>();
         List<Extent> freed = new ArrayList<>();
-        for (StoredRow current : rows.values()) {
+        for (StoredRow current : visible().values()) {
             Cell[] cells = new Cell[current.cells().length];
             for (int i = 0; i < current.cells().length; i++) {
                 cells[Schema.movedIndex(i, from, to)] = current.cells()[i];
@@ -588,6 +980,7 @@ final class TableStore implements AutoCloseable {
         indexes = adapt(schema, nextSchema, next.values());
         schema = nextSchema;
         rows = RowMap.adopt(next);
+        directory.clear();
         pendingFree.addAll(freed);
         dirty = true;
     }
@@ -603,7 +996,7 @@ final class TableStore implements AutoCloseable {
         }
         TreeMap<Long, StoredRow> next = new TreeMap<>();
         List<Extent> freed = new ArrayList<>();
-        for (StoredRow current : rows.values()) {
+        for (StoredRow current : visible().values()) {
             Cell[] cells = new Cell[current.cells().length - 1];
             for (int i = 0, target = 0; i < current.cells().length; i++) {
                 if (i != index) {
@@ -618,6 +1011,7 @@ final class TableStore implements AutoCloseable {
         indexes = adapt(schema, nextSchema, next.values());
         schema = nextSchema;
         rows = RowMap.adopt(next);
+        directory.clear();
         pendingFree.addAll(freed);
         dirty = true;
     }
@@ -629,6 +1023,16 @@ final class TableStore implements AutoCloseable {
         return snapshot;
     }
 
+    /** A snapshot whose row map will not change when later statements edit the table. */
+    Snapshot capture() {
+        Snapshot current = savepoint();
+        Snapshot copied = new Snapshot(current.schema, rows.copy(), List.copyOf(current.indexes),
+                new ArrayList<>(current.freeExtents), new ArrayList<>(current.pendingFree),
+                current.fileSize, current.nextRowId, current.metaOffset, current.metaLength,
+                current.generation, current.activeSlot, current.dirty, current.shared);
+        return pin(copied);
+    }
+
     /**
      * Copies a snapshot off the pages a checkpoint is about to overwrite.
      * The committed image keeps its rows, but its index roots and heap
@@ -638,7 +1042,17 @@ final class TableStore implements AutoCloseable {
         if (snapshot == null) {
             return null;
         }
+        List<StoredRow> image = new ArrayList<>();
         for (StoredRow row : snapshot.rows.values()) {
+            image.add(row);
+        }
+        for (LiveSlot slot : directory.values()) {
+            if (snapshot.rows.hidden(slot.rowId) || snapshot.rows.get(slot.rowId) != null) {
+                continue;
+            }
+            image.add(materialize(slot));
+        }
+        for (StoredRow row : image) {
             Cell[] cells = row.pinCells();
             for (int i = 0; i < cells.length; i++) {
                 Cell cell = cells[i];
@@ -651,7 +1065,7 @@ final class TableStore implements AutoCloseable {
         }
         List<IndexTree.DiskIndex> built = new ArrayList<>();
         for (IndexTree.DiskIndex index : IndexTree.empty(snapshot.schema)) {
-            built.add(index.fill(snapshot.schema, snapshot.rows.values(), this::keyParts, new ArrayList<>(), pages()));
+            built.add(index.fill(snapshot.schema, image, indexReader(), new ArrayList<>(), pages()));
         }
         return new Snapshot(snapshot.schema, snapshot.rows, built, snapshot.freeExtents, snapshot.pendingFree,
                 snapshot.fileSize, snapshot.nextRowId, snapshot.metaOffset, snapshot.metaLength,
@@ -779,6 +1193,9 @@ final class TableStore implements AutoCloseable {
         Map<Long, Cell[]> updatedCells = new LinkedHashMap<>();
         for (StoredRow row : rows.values()) {
             StoredRow original = base.rows.get(row.id);
+            if (original == null && directory.containsKey(row.id) && !base.rows.hidden(row.id)) {
+                original = materialize(directory.get(row.id));
+            }
             if (original == null) {
                 inserted.add(row.id);
                 insertedValues.put(row.id, valuesOf(schema, row));
@@ -800,20 +1217,37 @@ final class TableStore implements AutoCloseable {
             updatedCells.put(row.id, cells);
         }
         for (Long id : base.rows.keySet()) {
-            if (!rows.containsKey(id)) {
+            if (resolve(id) == null) {
                 deleted.add(id);
+            }
+        }
+        for (LiveSlot slot : directory.values()) {
+            if (rows.hidden(slot.rowId) && !deleted.contains(slot.rowId)) {
+                deleted.add(slot.rowId);
             }
         }
         for (Long id : updated) {
             StoredRow current = committed.rows.get(id);
+            if (current == null && directory.containsKey(id) && !committed.rows.hidden(id)) {
+                current = materialize(directory.get(id));
+            }
             StoredRow original = base.rows.get(id);
+            if (original == null && directory.containsKey(id)) {
+                original = materialize(directory.get(id));
+            }
             if (current == null || !Arrays.deepEquals(valuesOf(base.schema, original), valuesOf(committed.schema, current))) {
                 throw new SeaException("another transaction changed the same row of " + name);
             }
         }
         for (Long id : deleted) {
             StoredRow current = committed.rows.get(id);
+            if (current == null && directory.containsKey(id) && !committed.rows.hidden(id)) {
+                current = materialize(directory.get(id));
+            }
             StoredRow original = base.rows.get(id);
+            if (original == null && directory.containsKey(id)) {
+                original = materialize(directory.get(id));
+            }
             if (current == null || !Arrays.deepEquals(valuesOf(base.schema, original), valuesOf(committed.schema, current))) {
                 throw new SeaException("another transaction changed the same row of " + name);
             }
@@ -911,7 +1345,7 @@ final class TableStore implements AutoCloseable {
 
     long packedBytes() {
         long size = Format.HEADER_SIZE;
-        for (StoredRow row : rows.values()) {
+        for (StoredRow row : visible().values()) {
             for (int i = 0; i < row.cells().length; i++) {
                 Column column = schema.columns.get(i);
                 Cell cell = row.cells()[i];
@@ -934,7 +1368,7 @@ final class TableStore implements AutoCloseable {
     }
 
     void plantHeader() {
-        writeAt(0, FileHeader.fresh(Format.HEADER_SIZE, 1));
+        writeAt(0, FileHeader.fresh(file.metaVersion(schema), Format.HEADER_SIZE, 1));
     }
 
     /** Freezes the current rows so page bytes can be built while inserts continue. */
@@ -942,6 +1376,7 @@ final class TableStore implements AutoCloseable {
         TableStore snapshot = new TableStore(file, base, capacity);
         snapshot.schema = schema;
         snapshot.rows = rows;
+        snapshot.directory.putAll(directory);
         snapshot.indexes = List.copyOf(indexes);
         snapshot.freeExtents = new ArrayList<>(freeExtents);
         snapshot.pendingFree = new ArrayList<>(pendingFree);
@@ -1035,6 +1470,7 @@ final class TableStore implements AutoCloseable {
             indexes = IndexTree.attach(schema, plan.indexRoots);
         }
         dirty = rows.dirtyCount() > 0;
+        directory.clear();
         encodingLive = null;
         encodingSnapshot = null;
         encodeMerged = true;
@@ -1067,7 +1503,7 @@ final class TableStore implements AutoCloseable {
         Space space = pack ? new Space(List.of(), Format.HEADER_SIZE) : new Space(sourceFree, sourceFileSize);
         List<Write> writes = new ArrayList<>();
         List<StoredRow> changed = new ArrayList<>();
-        TreeMap<Long, StoredRow> committed = rows.tree();
+        TreeMap<Long, StoredRow> committed = visible();
         List<LiveSlot> lives = new ArrayList<>();
         for (StoredRow row : List.copyOf(committed.values())) {
             if (!pack && !row.dirty) {
@@ -1106,7 +1542,8 @@ final class TableStore implements AutoCloseable {
         }
         long[] roots = IndexTree.persist(sourceIndexes, space, writes, pages(), pack);
         List<Extent> reusable = freeForMeta(space, pack, sourcePending, sourceMetaOffset, sourceMetaLength);
-        byte[] natural = MetaCodec.encode(schema, sourceNext, 0, lives, reusable, roots);
+        int version = file.metaVersion(schema);
+        byte[] natural = MetaCodec.encode(schema, sourceNext, 0, lives, reusable, roots, 0, version);
         long exact = Format.align8(natural.length);
         long slack = Math.min(60000L, Math.max(256L, exact / 4));
         long wanted = Format.align8(exact + slack);
@@ -1115,7 +1552,7 @@ final class TableStore implements AutoCloseable {
         long metaAt = space.allocate(reserved);
         reusable = freeForMeta(space, pack, sourcePending, sourceMetaOffset, sourceMetaLength);
         long finalSize = space.fileSize();
-        byte[] meta = MetaCodec.encode(schema, nextRowId, finalSize, lives, reusable, roots, (int) reserved);
+        byte[] meta = MetaCodec.encode(schema, nextRowId, finalSize, lives, reusable, roots, (int) reserved, version);
         if (meta.length != reserved) {
             throw new SeaException("failed internally to write the metadata of " + schema.name);
         }
@@ -1167,7 +1604,7 @@ final class TableStore implements AutoCloseable {
         if (header[Format.SCRUB_OFFSET] == Format.SCRUB_CLEAN) {
             return;
         }
-        scrubExtents(freeExtents, metaOffset, metaLength, rows.values(), schema.name);
+        scrubExtents(freeExtents, metaOffset, metaLength, visible().values(), schema.name);
         if (fileSize < capacity) {
             file.zero(base + fileSize, capacity - fileSize);
             force();
@@ -1226,7 +1663,7 @@ final class TableStore implements AutoCloseable {
         byte[] header = readAt(0, Format.HEADER_SIZE);
         FileHeader.parse(header);
         header[Format.SCRUB_OFFSET] = Format.SCRUB_DIRTY;
-        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) Format.VERSION);
+        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) file.metaVersion(schema));
         FileHeader.writeSlot(header, plan.targetSlot, plan.generation, plan.metaOffset, plan.metaLength);
         writeAt(0, header);
         force();
@@ -1245,6 +1682,7 @@ final class TableStore implements AutoCloseable {
         nextRowId = plan.nextRowId;
         dirty = false;
         shared = false;
+        directory.clear();
         indexes = IndexTree.attach(plan.schema, plan.indexRoots);
     }
 
@@ -1277,21 +1715,20 @@ final class TableStore implements AutoCloseable {
         freeExtents = Extent.coalesce(freeExtents);
         pendingFree = new ArrayList<>();
         rows = new RowMap();
+        directory.clear();
+        slotReader = new SlotReader(schema);
         shared = false;
         boolean droppedConnection = false;
-        StoredRow.Loader reader = new SlotReader(schema);
         for (LiveSlot slot : image.rows) {
             try {
                 if (slot.offset < Format.HEADER_SIZE || slot.size <= Format.BLOCK_HEADER
                         || slot.size > Integer.MAX_VALUE || slot.offset > fileSize - slot.size) {
                     throw new SeaException("corrupt record in table " + schema.name);
                 }
-                StoredRow row = new StoredRow(slot.rowId, slot.offset, slot.size, reader);
-                // Stale connection rows have a recovery path that must run on open.
                 if (Names.same(schema.name, SystemTables.CONNECTIONS)) {
-                    row.pinCells();
+                    materialize(slot).pinCells();
                 }
-                rows.put(row.id, row);
+                directory.put(slot.rowId, slot);
             } catch (SeaException exception) {
                 if (!Names.same(schema.name, SystemTables.CONNECTIONS) || !exception.getMessage().startsWith("corrupt record")) {
                     throw exception;
@@ -1310,7 +1747,7 @@ final class TableStore implements AutoCloseable {
         }
         indexes = IndexTree.attach(schema, image.indexRoots);
         if (scrub) {
-            scrubExtents(freeExtents, metaOffset, metaLength, rows.values(), schema.name);
+            scrubExtents(freeExtents, metaOffset, metaLength, visible().values(), schema.name);
             if (fileSize < capacity) {
                 file.zero(base + fileSize, capacity - fileSize);
                 force();
@@ -1327,13 +1764,14 @@ final class TableStore implements AutoCloseable {
         this.schema = schema;
         indexes = IndexTree.empty(schema);
         long[] roots = new long[indexes.size()];
-        byte[] draft = MetaCodec.encode(schema, 1, 0, List.of(), List.of(), roots);
+        int version = file.metaVersion(schema);
+        byte[] draft = MetaCodec.encode(schema, 1, 0, List.of(), List.of(), roots, 0, version);
         long size = Format.HEADER_SIZE + draft.length;
-        byte[] meta = MetaCodec.encode(schema, 1, size, List.of(), List.of(), roots);
+        byte[] meta = MetaCodec.encode(schema, 1, size, List.of(), List.of(), roots, 0, version);
         if (meta.length != draft.length) {
             throw new SeaException("failed internally to create table " + schema.name);
         }
-        writeAt(0, FileHeader.fresh(Format.HEADER_SIZE, meta.length));
+        writeAt(0, FileHeader.fresh(version, Format.HEADER_SIZE, meta.length));
         writeAt(Format.HEADER_SIZE, meta);
         force();
         fileSize = size;
@@ -1425,7 +1863,8 @@ final class TableStore implements AutoCloseable {
         List<Extent> extra = new ArrayList<>();
         for (IndexTree.DiskIndex index : indexes) {
             Object[] values = keyParts(schema, index, row);
-            next.add(values == null ? index : index.insert(schema, values, row.id, extra, pages()));
+            byte[] covered = values == null ? null : coverPayload(schema, index, row);
+            next.add(values == null ? index : index.insert(schema, values, row.id, covered, extra, pages()));
         }
         indexes = next;
         pendingFree.addAll(extra);
@@ -1445,7 +1884,9 @@ final class TableStore implements AutoCloseable {
         for (IndexTree.DiskIndex index : indexes) {
             Object[] oldValues = keyParts(before, index, current);
             Object[] newValues = keyParts(after, index, replacement);
-            if (java.util.Arrays.deepEquals(oldValues, newValues)) {
+            byte[] oldCover = oldValues == null ? null : coverPayload(before, index, current);
+            byte[] newCover = newValues == null ? null : coverPayload(after, index, replacement);
+            if (java.util.Arrays.deepEquals(oldValues, newValues) && java.util.Arrays.equals(oldCover, newCover)) {
                 next.add(index);
                 continue;
             }
@@ -1454,7 +1895,7 @@ final class TableStore implements AutoCloseable {
                 changed = changed.delete(before, oldValues, current.id, extra, pages());
             }
             if (newValues != null) {
-                changed = changed.insert(after, newValues, current.id, extra, pages());
+                changed = changed.insert(after, newValues, current.id, newCover, extra, pages());
             }
             next.add(changed);
         }
@@ -1469,7 +1910,7 @@ final class TableStore implements AutoCloseable {
             next.add(indexes.get(0));
         } else if (primary) {
             next.add(IndexTree.DiskIndex.empty(new IndexTree.Spec(nextSchema.primaryIndex, new int[]{column}, true, true))
-                    .fill(nextSchema, rows.values(), this::keyParts, extra, pages()));
+                    .fill(nextSchema, rows.values(), indexReader(), extra, pages()));
         }
         int uniqueFrom = schema.primaryKey.length > 0 ? 1 : 0;
         int uniqueCount = schema.uniques.size();
@@ -1479,7 +1920,7 @@ final class TableStore implements AutoCloseable {
         if (nextSchema.uniques.size() > schema.uniques.size()) {
             UniqueKey added = nextSchema.uniques.get(nextSchema.uniques.size() - 1);
             next.add(IndexTree.DiskIndex.empty(new IndexTree.Spec(added.name, added.columns, false, true))
-                    .fill(nextSchema, rows.values(), this::keyParts, extra, pages()));
+                    .fill(nextSchema, rows.values(), indexReader(), extra, pages()));
         }
         for (int i = uniqueFrom + uniqueCount; i < indexes.size(); i++) {
             next.add(indexes.get(i));
@@ -1499,7 +1940,7 @@ final class TableStore implements AutoCloseable {
                 used[found] = true;
                 next.add(indexes.get(found).withColumns(spec.columns()));
             } else {
-                next.add(IndexTree.DiskIndex.empty(spec).fill(after, rows, this::keyParts, extra, pages()));
+                next.add(IndexTree.DiskIndex.empty(spec).fill(after, rows, indexReader(), extra, pages()));
             }
         }
         for (int i = 0; i < indexes.size(); i++) {
@@ -1547,12 +1988,42 @@ final class TableStore implements AutoCloseable {
         return Names.generatedUnique(name);
     }
 
+    private IndexTree.KeyReader indexReader() {
+        return new IndexTree.KeyReader() {
+            @Override
+            public Object[] parts(Schema schema, IndexTree.DiskIndex index, StoredRow row) {
+                return keyParts(schema, index, row);
+            }
+
+            @Override
+            public byte[] covered(Schema schema, IndexTree.DiskIndex index, StoredRow row) {
+                return coverPayload(schema, index, row);
+            }
+        };
+    }
+
     private Object[] keyParts(Schema target, IndexTree.DiskIndex index, StoredRow row) {
+        if (index.predicate != null && !indexPredicate(target, index, row)) {
+            return null;
+        }
         Object[] values = new Object[index.columns.length];
+        Evaluator evaluator = null;
         for (int i = 0; i < index.columns.length; i++) {
             int columnIndex = index.columns[i];
             Column column = target.columns.get(columnIndex);
-            Object value = logical(row.cells()[columnIndex], column);
+            Object value;
+            if (index.expressionAt(i)) {
+                if (evaluator == null) {
+                    evaluator = new Evaluator(this, null, null);
+                    evaluator.bind(row);
+                }
+                value = evaluator.eval(SqlParser.parseExpression(index.expressions[i]));
+                if (value != null) {
+                    value = Values.coerce(column.type, column.length, column.scale, value);
+                }
+            } else {
+                value = logical(row.cells()[columnIndex], column);
+            }
             if (value == null) {
                 if (index.primary) {
                     throw new SeaException("primary key does not accept NULL in " + target.name + "." + column.name);
@@ -1562,6 +2033,24 @@ final class TableStore implements AutoCloseable {
             values[i] = value;
         }
         return values;
+    }
+
+    private boolean indexPredicate(Schema target, IndexTree.DiskIndex index, StoredRow row) {
+        Evaluator evaluator = new Evaluator(this, null, null);
+        evaluator.bind(row);
+        return evaluator.truth(SqlParser.parseExpression(index.predicate));
+    }
+
+    private byte[] coverPayload(Schema target, IndexTree.DiskIndex index, StoredRow row) {
+        if (index.include.length == 0) {
+            return null;
+        }
+        Object[] values = new Object[index.include.length];
+        for (int i = 0; i < index.include.length; i++) {
+            int columnIndex = index.include[i];
+            values[i] = logical(row.cells()[columnIndex], target.columns.get(columnIndex));
+        }
+        return IndexTree.Cover.encode(target, index.include, values);
     }
 
     private IndexTree.PageSource pages() {
@@ -1710,7 +2199,7 @@ final class TableStore implements AutoCloseable {
                 return true;
             }
         }
-        for (StoredRow row : rows.values()) {
+        for (StoredRow row : visible().values()) {
             if (row.slotOffset >= 0 && overlaps(offset, size, row.slotOffset, row.slotSize)) {
                 return true;
             }
@@ -1773,8 +2262,12 @@ final class TableStore implements AutoCloseable {
 
     private static void rejectBlobKey(Schema schema, int[] indexes) {
         for (int index : indexes) {
-            if (schema.columns.get(index).type == DataType.BLOB) {
+            Column column = schema.columns.get(index);
+            if (column.type == DataType.BLOB) {
                 throw new SeaException("BLOB cannot be a key");
+            }
+            if (column.generated != null) {
+                throw new SeaException("generated column cannot be a key: " + column.name);
             }
         }
     }
@@ -1858,5 +2351,11 @@ final class TableStore implements AutoCloseable {
             this.nextRowId = nextRowId;
             this.indexRoots = indexRoots;
         }
+    }
+
+    static record IndexStat(long rows, long entries, String min, String max) {
+    }
+
+    static record IndexCensus(String name, long entries, String min, String max) {
     }
 }

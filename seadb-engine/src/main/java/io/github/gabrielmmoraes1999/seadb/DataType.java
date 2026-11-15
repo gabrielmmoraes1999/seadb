@@ -17,7 +17,11 @@ public enum DataType {
     SMALLINT,
     FLOAT,
     TIME,
-    BIGINT;
+    BIGINT,
+    UUID,
+    JSON,
+    INTERVAL,
+    TIMESTAMPTZ;
 
     public boolean exactInteger() {
         return this == SMALLINT || this == INTEGER || this == BIGINT;

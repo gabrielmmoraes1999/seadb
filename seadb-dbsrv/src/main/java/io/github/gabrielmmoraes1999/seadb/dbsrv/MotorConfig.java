@@ -14,7 +14,11 @@ import java.util.Set;
  * The {@code .log} sits beside each file and the server opens it too.
  * The name in {@code jdbc:seadb://host:port/name} selects the entry, ignoring case.
  */
-public record MotorConfig(String host, int port, List<DatabaseSpec> databases) {
+public record MotorConfig(String host, int port, List<DatabaseSpec> databases, Path sslKeystore, String sslPassword) {
+
+    public MotorConfig(String host, int port, List<DatabaseSpec> databases) {
+        this(host, port, databases, null, null);
+    }
 
     public MotorConfig {
         if (host == null || host.isBlank()) {

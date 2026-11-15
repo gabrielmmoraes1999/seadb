@@ -12,13 +12,17 @@ public final class SeaTarget {
     private final String host;
     private final int port;
     private final String database;
+    private final boolean ssl;
+    private final String sslCert;
 
-    private SeaTarget(boolean embedded, String path, String host, int port, String database) {
+    private SeaTarget(boolean embedded, String path, String host, int port, String database, boolean ssl, String sslCert) {
         this.embedded = embedded;
         this.path = path;
         this.host = host;
         this.port = port;
         this.database = database;
+        this.ssl = ssl;
+        this.sslCert = sslCert;
     }
 
     public static SeaTarget parse(String url) {
@@ -59,8 +63,16 @@ public final class SeaTarget {
         return database;
     }
 
+    public boolean ssl() {
+        return ssl;
+    }
+
+    public String sslCert() {
+        return sslCert;
+    }
+
     private static SeaTarget embedded(String path) {
-        return new SeaTarget(true, path, "", 0, "");
+        return new SeaTarget(true, path, "", 0, "", false, "");
     }
 
     private static SeaTarget server(String after) {
@@ -93,8 +105,31 @@ public final class SeaTarget {
         }
         String portText = tail.substring(0, slash).trim();
         String name = tail.substring(slash + 1).trim();
-        if (name.isEmpty() || name.indexOf('/') >= 0 || name.indexOf('?') >= 0 || name.indexOf('#') >= 0) {
+        String query = "";
+        int mark = name.indexOf('?');
+        if (mark >= 0) {
+            query = name.substring(mark + 1);
+            name = name.substring(0, mark).trim();
+        }
+        if (name.isEmpty() || name.indexOf('/') >= 0 || name.indexOf('#') >= 0) {
             throw new SeaException("specify the database name in the URL jdbc:seadb://host:port/name");
+        }
+        boolean ssl = false;
+        String cert = "";
+        if (!query.isBlank()) {
+            for (String part : query.split("&")) {
+                int eq = part.indexOf('=');
+                String key = (eq < 0 ? part : part.substring(0, eq)).trim();
+                String value = eq < 0 ? "" : part.substring(eq + 1).trim();
+                if (key.equalsIgnoreCase("ssl")) {
+                    ssl = value.equalsIgnoreCase("true");
+                } else if (key.equalsIgnoreCase("sslCert")) {
+                    cert = java.net.URLDecoder.decode(value, java.nio.charset.StandardCharsets.UTF_8);
+                }
+            }
+        }
+        if (ssl && cert.isBlank()) {
+            throw new SeaException("sslCert is required when ssl=true");
         }
         int port;
         try {
@@ -108,7 +143,7 @@ public final class SeaTarget {
         if (host.isEmpty()) {
             throw new SeaException("specify the host in the URL jdbc:seadb://host:port/name");
         }
-        return new SeaTarget(false, "", host, port, name);
+        return new SeaTarget(false, "", host, port, name, ssl, cert);
     }
 
     private static boolean windowsDrive(String text) {

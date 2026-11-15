@@ -91,6 +91,13 @@ class ArgumentsTest {
                 () -> Arguments.parse(Kind.PERSONAL, new String[]{"a.db", "other/a.db"})).getMessage().contains("duplicate"));
         assertTrue(assertThrows(SeaException.class,
                 () -> Arguments.parse(Kind.NETWORK, new String[]{"--quiet"})).getMessage().contains("unknown"));
+        assertTrue(assertThrows(SeaException.class, () -> Arguments.parse(Kind.PERSONAL, new String[]{
+                "--ssl-keystore", "server.p12", "--ssl-password", "secret", "a.db"
+        })).getMessage().contains("does not accept TLS"));
+        Arguments tls = Arguments.parse(Kind.NETWORK, new String[]{
+                "--ssl-keystore", "server.p12", "--ssl-password", "secret", "a.db"});
+        assertTrue(tls.sslKeystore().endsWith("server.p12"));
+        assertEquals("secret", tls.sslPassword());
         assertTrue(Arguments.usage(Kind.PERSONAL).contains("seadb-dbeng"));
         assertTrue(Arguments.usage(Kind.NETWORK).contains("seadb-dbsrv"));
     }

@@ -1,5 +1,6 @@
 package io.github.gabrielmmoraes1999.seadb.jdbc;
 
+import io.github.gabrielmmoraes1999.seadb.ParameterMeta;
 import io.github.gabrielmmoraes1999.seadb.SqlResult;
 import io.github.gabrielmmoraes1999.seadb.TableDescription;
 
@@ -39,6 +40,7 @@ final class SeaConnection implements Connection {
     private int holdability = ResultSet.HOLD_CURSORS_OVER_COMMIT;
     private int isolation = TRANSACTION_SERIALIZABLE;
     private int networkTimeout;
+    private int savepointSeq;
 
     SeaConnection(String url, DatabaseAccess access) {
         this.url = url;
@@ -90,7 +92,7 @@ final class SeaConnection implements Connection {
 
     @Override
     public CallableStatement prepareCall(String sql) throws SQLException {
-        throw Jdbc.unsupported("procedure");
+        return prepareCall(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY, holdability);
     }
 
     @Override
@@ -237,6 +239,13 @@ final class SeaConnection implements Connection {
                 throw new SQLException("invalid isolation level: " + level);
             }
             this.isolation = level;
+            String sql = switch (level) {
+                case TRANSACTION_READ_UNCOMMITTED -> "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED";
+                case TRANSACTION_READ_COMMITTED -> "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+                case TRANSACTION_REPEATABLE_READ -> "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+                default -> "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+            };
+            execute(sql, new Object[0]);
         }
     }
 
@@ -271,7 +280,7 @@ final class SeaConnection implements Connection {
 
     @Override
     public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency) throws SQLException {
-        throw Jdbc.unsupported("procedure");
+        return prepareCall(sql, resultSetType, resultSetConcurrency, holdability);
     }
 
     @Override
@@ -314,22 +323,41 @@ final class SeaConnection implements Connection {
 
     @Override
     public Savepoint setSavepoint() throws SQLException {
-        throw Jdbc.unsupported("savepoint");
+        return setSavepoint("sp" + (++savepointSeq));
     }
 
     @Override
     public Savepoint setSavepoint(String name) throws SQLException {
-        throw Jdbc.unsupported("savepoint");
+        synchronized (lock()) {
+            checkOpen();
+            if (autoCommit) {
+                throw new SQLException("savepoint requires a transaction", "25000");
+            }
+            if (name == null || name.isBlank()) {
+                throw new SQLException("savepoint name is required");
+            }
+            beforeStatement("SAVEPOINT " + name);
+            execute("SAVEPOINT " + name, new Object[0]);
+            return new SeaSavepoint(name);
+        }
     }
 
     @Override
     public void rollback(Savepoint savepoint) throws SQLException {
-        throw Jdbc.unsupported("savepoint");
+        synchronized (lock()) {
+            checkOpen();
+            String name = savepointName(savepoint);
+            execute("ROLLBACK TO SAVEPOINT " + name, new Object[0]);
+        }
     }
 
     @Override
     public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-        throw Jdbc.unsupported("savepoint");
+        synchronized (lock()) {
+            checkOpen();
+            String name = savepointName(savepoint);
+            execute("RELEASE SAVEPOINT " + name, new Object[0]);
+        }
     }
 
     @Override
@@ -363,7 +391,22 @@ final class SeaConnection implements Connection {
     @Override
     public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
             throws SQLException {
-        throw Jdbc.unsupported("procedure");
+        synchronized (lock()) {
+            checkOpen();
+            String call = Jdbc.procedureCall(sql);
+            checkResultSet(resultSetType, resultSetConcurrency);
+            SeaCallableStatement statement = new SeaCallableStatement(
+                    this, call, resultSetType, resultSetConcurrency, resultSetHoldability);
+            statements.add(statement);
+            return statement;
+        }
+    }
+
+    List<ParameterMeta> describeParameters(String sql) throws SQLException {
+        synchronized (lock()) {
+            checkOpen();
+            return access.describeParameters(sql);
+        }
     }
 
     @Override
@@ -521,6 +564,41 @@ final class SeaConnection implements Connection {
 
     SqlResult execute(String sql, Object[] params) throws SQLException {
         return access.execute(sql, params);
+    }
+
+    SqlResult execute(String sql, Object[] params, int fetch) throws SQLException {
+        return access.execute(sql, params, fetch);
+    }
+
+    SqlResult execute(String sql, Object[] params, int fetch, int timeoutSeconds) throws SQLException {
+        return access.execute(sql, params, fetch, timeoutSeconds);
+    }
+
+    void cancel() throws SQLException {
+        access.cancel();
+    }
+
+    SqlResult fetch(long cursor, int count) throws SQLException {
+        return access.fetch(cursor, count);
+    }
+
+    private static String savepointName(Savepoint savepoint) throws SQLException {
+        if (savepoint instanceof SeaSavepoint named) {
+            return named.name;
+        }
+        throw new SQLException("savepoint does not belong to this connection");
+    }
+
+    private record SeaSavepoint(String name) implements Savepoint {
+        @Override
+        public int getSavepointId() throws SQLException {
+            throw new SQLException("the savepoint is named");
+        }
+
+        @Override
+        public String getSavepointName() {
+            return name;
+        }
     }
 
     void checkOpen() throws SQLException {

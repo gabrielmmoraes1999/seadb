@@ -65,7 +65,8 @@ public final class SeaDriver implements Driver {
                 return new SeaConnection(url, new LocalAccess(opened.shared(), opened.session()));
             }
             return new SeaConnection(url, RemoteAccess.connect(
-                    target.host(), target.port(), target.database(), user, password, role));
+                    target.host(), target.port(), target.database(), user, password, role,
+                    target.ssl(), target.sslCert()));
         } catch (SeaException exception) {
             throw Jdbc.wrap(exception);
         }

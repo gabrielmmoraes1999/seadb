@@ -251,6 +251,13 @@ public final class StartDialog extends JDialog {
             }
             text.append("--host ").append(preset.host());
         }
+        if (preset.sslKeystore() != null) {
+            if (!text.isEmpty()) {
+                text.append(' ');
+            }
+            text.append("--ssl-keystore ").append(preset.sslKeystore());
+            text.append(" --ssl-password ").append(preset.sslPassword());
+        }
         if (preset.applyLog() != null) {
             if (!text.isEmpty()) {
                 text.append(' ');

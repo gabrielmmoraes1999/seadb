@@ -75,6 +75,8 @@ final class DatabaseFile implements AutoCloseable {
     private long generation;
     private int activeSlot;
     private int pageSize;
+    private int formatVersion = Format.DB_VERSION;
+    private int versionAtCommit = Format.DB_VERSION;
     private long catalogSpan;
     private List<Extent> freeExtents = new ArrayList<>();
     private List<StoredTable> tables = List.of();
@@ -444,11 +446,11 @@ final class DatabaseFile implements AutoCloseable {
             retireNow.add(new Extent(catalogOffset, catalogSpan));
         }
         long committed = fileSize;
-        byte[] probe = CatalogCodec.encode(0, nextTables, allocator.free());
+        byte[] probe = CatalogCodec.encode(formatVersion, 0, nextTables, allocator.free());
         long span = pagedLength(probe.length);
         long at = allocator.allocate(span);
         long publishedSize = allocator.fileSize();
-        byte[] catalog = CatalogCodec.encode(publishedSize, nextTables, allocator.free());
+        byte[] catalog = CatalogCodec.encode(formatVersion, publishedSize, nextTables, allocator.free());
         if (pagedLength(catalog.length) > span) {
             throw new SeaException("internal failure while writing the catalog");
         }
@@ -643,10 +645,12 @@ final class DatabaseFile implements AutoCloseable {
     }
 
     private void createEmpty() {
-        byte[] draft = CatalogCodec.encode(0, List.of(), List.of());
+        formatVersion = Format.DB_VERSION;
+        versionAtCommit = formatVersion;
+        byte[] draft = CatalogCodec.encode(formatVersion, 0, List.of(), List.of());
         long span = pagedLength(draft.length);
         long size = pageSize + span;
-        byte[] catalog = CatalogCodec.encode(size, List.of(), List.of());
+        byte[] catalog = CatalogCodec.encode(formatVersion, size, List.of(), List.of());
         if (catalog.length != draft.length) {
             throw new SeaException("internal failure while creating the database");
         }
@@ -701,9 +705,11 @@ final class DatabaseFile implements AutoCloseable {
         }
         ByteBuffer buffer = ByteBuffer.wrap(header).order(Format.ORDER);
         int version = buffer.getShort(Format.VERSION_OFFSET) & 0xFFFF;
-        if (version != Format.DB_VERSION) {
+        if (!Format.known(version)) {
             throw new SeaException("unsupported database version: " + version);
         }
+        formatVersion = version;
+        versionAtCommit = version;
         pageSize = Format.checkPageSize(buffer.getInt(Format.PAGE_SIZE_OFFSET));
         cache.accept(pageSize);
         logId = buffer.getLong(Format.LOG_ID_OFFSET);
@@ -964,6 +970,21 @@ final class DatabaseFile implements AutoCloseable {
             throw new SeaException("internal failure: commit already started");
         }
         commit = new CommitBuffer(fileSize);
+        versionAtCommit = formatVersion;
+    }
+
+    int metaVersion(Schema schema) {
+        if (schema != null && schema.needsV2()) {
+            formatVersion = Format.DB_VERSION;
+        }
+        return formatVersion;
+    }
+
+    private void writeFormatVersion() {
+        byte[] header = readBytes(0, Format.DB_HEADER_SIZE);
+        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) formatVersion);
+        writeBytes(0, header);
+        versionAtCommit = formatVersion;
     }
 
     void finishCommit() {
@@ -992,10 +1013,15 @@ final class DatabaseFile implements AutoCloseable {
             truncatePhysical(buffer.fileSize());
             fileSize = buffer.fileSize();
             forceChannel();
+            if (formatVersion != versionAtCommit) {
+                writeFormatVersion();
+            }
             return;
         }
         if (commitId != null) {
             log.appendCommit(commitId);
+        } else if (statements != null && !statements.isEmpty()) {
+            log.appendCommit(0);
         }
         if (rollbackId != null) {
             log.appendRollback(rollbackId);
@@ -1015,6 +1041,9 @@ final class DatabaseFile implements AutoCloseable {
         truncatePhysical(buffer.fileSize());
         fileSize = buffer.fileSize();
         appliedToDisk = true;
+        if (formatVersion != versionAtCommit) {
+            writeFormatVersion();
+        }
         checkpoint();
     }
 
@@ -1149,6 +1178,7 @@ final class DatabaseFile implements AutoCloseable {
         if (recoveryPending) {
             return;
         }
+        formatVersion = versionAtCommit;
         if (commit != null) {
             fileSize = commit.originalSize();
             commit = null;
@@ -1698,10 +1728,10 @@ final class DatabaseFile implements AutoCloseable {
         private CatalogCodec() {
         }
 
-        static byte[] encode(long fileSize, List<StoredTable> tables, List<Extent> free) {
+        static byte[] encode(int version, long fileSize, List<StoredTable> tables, List<Extent> free) {
             ByteWriter writer = new ByteWriter();
             writer.u32(Format.CATALOG_MAGIC);
-            writer.u32(Format.DB_VERSION);
+            writer.u32(version);
             writer.u64(fileSize);
             writer.u32(tables.size());
             for (StoredTable table : tables) {
@@ -1747,7 +1777,7 @@ final class DatabaseFile implements AutoCloseable {
                 throw new SeaException("database catalog is corrupt");
             }
             int version = reader.u32();
-            if (version != Format.DB_VERSION) {
+            if (!Format.known(version)) {
                 throw new SeaException("unsupported catalog version: " + version);
             }
             long size = reader.u64();

@@ -15,9 +15,22 @@ final class Column {
     final long nextIdentity;
     final boolean hasDefault;
     final Object defaultValue;
+    /** {@code 0} is binary UTF-8. {@code 1} is {@code UNICODE_CI}. */
+    final int collation;
+    final String domain;
+    /** SQL of a {@code GENERATED ALWAYS AS} expression. Null when the column is stored by the user. */
+    final String generated;
+    /** SQL of a default expression. Null when the default is the literal in {@link #defaultValue}. */
+    final String defaultExpr;
 
     Column(String name, DataType type, int length, int scale, boolean notNull, boolean autoIncrement,
            long nextIdentity, boolean hasDefault, Object defaultValue) {
+        this(name, type, length, scale, notNull, autoIncrement, nextIdentity, hasDefault, defaultValue, 0, null, null, null);
+    }
+
+    Column(String name, DataType type, int length, int scale, boolean notNull, boolean autoIncrement,
+           long nextIdentity, boolean hasDefault, Object defaultValue, int collation, String domain,
+           String generated, String defaultExpr) {
         this.name = name;
         this.type = type;
         this.length = length;
@@ -27,26 +40,58 @@ final class Column {
         this.nextIdentity = nextIdentity;
         this.hasDefault = hasDefault;
         this.defaultValue = defaultValue;
+        this.collation = collation;
+        this.domain = domain == null || domain.isEmpty() ? null : domain;
+        this.generated = generated == null || generated.isEmpty() ? null : generated;
+        this.defaultExpr = defaultExpr == null || defaultExpr.isEmpty() ? null : defaultExpr;
     }
 
     Column withIdentity(long next) {
-        return new Column(name, type, length, scale, notNull, autoIncrement, next, hasDefault, defaultValue);
+        return new Column(name, type, length, scale, notNull, autoIncrement, next, hasDefault, defaultValue,
+                collation, domain, generated, defaultExpr);
     }
 
     Column asNotNull() {
         if (notNull) {
             return this;
         }
-        return new Column(name, type, length, scale, true, autoIncrement, nextIdentity, hasDefault, defaultValue);
+        return new Column(name, type, length, scale, true, autoIncrement, nextIdentity, hasDefault, defaultValue,
+                collation, domain, generated, defaultExpr);
+    }
+
+    Column withNullability(boolean required) {
+        return new Column(name, type, length, scale, required, autoIncrement, nextIdentity, hasDefault, defaultValue,
+                collation, domain, generated, defaultExpr);
+    }
+
+    Column withDefault(boolean present, Object literal, String expression) {
+        return new Column(name, type, length, scale, notNull, autoIncrement, nextIdentity, present, literal,
+                collation, domain, generated, expression);
+    }
+
+    Column renamed(String next) {
+        return new Column(next, type, length, scale, notNull, autoIncrement, nextIdentity, hasDefault, defaultValue,
+                collation, domain, generated, defaultExpr);
+    }
+
+    Column retyped(DataType nextType, int nextLength, int nextScale) {
+        return new Column(name, nextType, nextLength, nextScale, notNull, autoIncrement, nextIdentity, hasDefault, defaultValue,
+                collation, domain, generated, defaultExpr);
     }
 
     boolean heapBacked() {
         return type == DataType.BLOB
+                || type == DataType.JSON
                 || ((type == DataType.CHAR || type == DataType.VARCHAR) && length > Format.INLINE_CHAR);
     }
 
     boolean character() {
-        return type == DataType.CHAR || type == DataType.VARCHAR;
+        return type == DataType.CHAR || type == DataType.VARCHAR || type == DataType.JSON;
+    }
+
+    boolean needsV2() {
+        return collation != Collation.BINARY || domain != null || generated != null || defaultExpr != null
+                || type.ordinal() > DataType.BIGINT.ordinal();
     }
 }
 
@@ -55,16 +100,56 @@ final class IndexDef {
     final int[] columns;
     final boolean unique;
     final boolean descending;
+    /** Null when every row is indexed. */
+    final String predicate;
+    /** Parallel to {@link #columns}. Null in a slot means the key is the column itself. */
+    final String[] expressions;
+    final int[] include;
 
     IndexDef(String name, int[] columns, boolean unique) {
         this(name, columns, unique, false);
     }
 
     IndexDef(String name, int[] columns, boolean unique, boolean descending) {
+        this(name, columns, unique, descending, null, null, new int[0]);
+    }
+
+    IndexDef(String name, int[] columns, boolean unique, boolean descending, String predicate,
+             String[] expressions, int[] include) {
         this.name = name;
         this.columns = columns.clone();
         this.unique = unique;
         this.descending = descending;
+        this.predicate = predicate == null || predicate.isBlank() ? null : predicate;
+        this.expressions = expressions == null ? null : expressions.clone();
+        this.include = include == null ? new int[0] : include.clone();
+    }
+
+    IndexDef copy() {
+        return new IndexDef(name, columns, unique, descending, predicate, expressions, include);
+    }
+
+    boolean extended() {
+        if (predicate != null || include.length > 0) {
+            return true;
+        }
+        if (expressions == null) {
+            return false;
+        }
+        for (String expression : expressions) {
+            if (expression != null && !expression.isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    String expressionAt(int index) {
+        if (expressions == null || index < 0 || index >= expressions.length) {
+            return null;
+        }
+        String expression = expressions[index];
+        return expression == null || expression.isBlank() ? null : expression;
     }
 }
 
@@ -79,6 +164,19 @@ final class UniqueKey {
 
     UniqueKey withColumns(int[] columns) {
         return new UniqueKey(name, columns);
+    }
+}
+
+final class CheckConstraint {
+    final String name;
+    /** Null when the check belongs to the table rather than one column. */
+    final String column;
+    final String expression;
+
+    CheckConstraint(String name, String column, String expression) {
+        this.name = name;
+        this.column = column == null || column.isEmpty() ? null : column;
+        this.expression = expression;
     }
 }
 
@@ -123,6 +221,7 @@ final class Schema {
     final String primaryIndex;
     final boolean primaryDescending;
     final List<ForeignKey> foreignKeys;
+    final List<CheckConstraint> checks;
 
     Schema(String name, List<Column> columns, int[] primaryKey, List<UniqueKey> uniques, List<IndexDef> indexes) {
         this(name, columns, primaryKey, uniques, indexes,
@@ -134,13 +233,17 @@ final class Schema {
 
     Schema(String name, List<Column> columns, int[] primaryKey, List<UniqueKey> uniques, List<IndexDef> indexes,
            String primaryConstraint, String primaryIndex, boolean primaryDescending, List<ForeignKey> foreignKeys) {
+        this(name, columns, primaryKey, uniques, indexes, primaryConstraint, primaryIndex, primaryDescending, foreignKeys, List.of());
+    }
+
+    Schema(String name, List<Column> columns, int[] primaryKey, List<UniqueKey> uniques, List<IndexDef> indexes,
+           String primaryConstraint, String primaryIndex, boolean primaryDescending, List<ForeignKey> foreignKeys,
+           List<CheckConstraint> checks) {
         this.name = name;
         this.columns = List.copyOf(columns);
         this.primaryKey = primaryKey.clone();
         this.uniques = uniques.stream().map(key -> new UniqueKey(key.name, key.columns)).toList();
-        this.indexes = indexes.stream()
-                .map(index -> new IndexDef(index.name, index.columns, index.unique, index.descending))
-                .toList();
+        this.indexes = indexes.stream().map(IndexDef::copy).toList();
         if (this.primaryKey.length == 0) {
             this.primaryConstraint = "";
             this.primaryIndex = "";
@@ -154,6 +257,49 @@ final class Schema {
                 .map(key -> new ForeignKey(key.name, key.columns, key.referencedSchema, key.referencedTable,
                         key.referencedColumns, key.indexName, key.descending, key.onUpdate, key.onDelete))
                 .toList();
+        this.checks = checks == null ? List.of() : List.copyOf(checks);
+    }
+
+    boolean needsV2() {
+        if (!checks.isEmpty()) {
+            return true;
+        }
+        for (Column column : columns) {
+            if (column.needsV2()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean needsIndexExtensions() {
+        for (IndexDef index : indexes) {
+            if (index.extended()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Schema withForeignKeys(List<ForeignKey> next) {
+        return copy(new ArrayList<>(columns), primaryKey, uniques, indexes, primaryConstraint, primaryIndex,
+                primaryDescending, next, checks);
+    }
+
+    Schema withChecks(List<CheckConstraint> next) {
+        return copy(new ArrayList<>(columns), primaryKey, uniques, indexes, primaryConstraint, primaryIndex,
+                primaryDescending, foreignKeys, next);
+    }
+
+    Schema withColumn(int index, Column column) {
+        List<Column> copy = new ArrayList<>(columns);
+        copy.set(index, column);
+        return copy(copy, primaryKey, uniques, indexes, primaryConstraint, primaryIndex, primaryDescending, foreignKeys, checks);
+    }
+
+    Schema renamed(String next) {
+        return new Schema(next, columns, primaryKey, uniques, indexes, primaryConstraint, primaryIndex,
+                primaryDescending, foreignKeys, checks);
     }
 
     int indexOf(String columnName) {
@@ -327,7 +473,8 @@ final class Schema {
         List<IndexDef> kept = new ArrayList<>();
         for (IndexDef definition : indexes) {
             kept.add(new IndexDef(definition.name, remapMove(definition.columns, from, to),
-                    definition.unique, definition.descending));
+                    definition.unique, definition.descending, definition.predicate, definition.expressions,
+                    remapMove(definition.include, from, to)));
         }
         List<ForeignKey> keys = new ArrayList<>();
         for (ForeignKey key : foreignKeys) {
@@ -364,10 +511,11 @@ final class Schema {
         }
         List<IndexDef> kept = new ArrayList<>();
         for (IndexDef definition : indexes) {
-            if (contains(definition.columns, index)) {
+            if (contains(definition.columns, index) || contains(definition.include, index)) {
                 continue;
             }
-            kept.add(new IndexDef(definition.name, remap(definition.columns, index), definition.unique, definition.descending));
+            kept.add(new IndexDef(definition.name, remap(definition.columns, index), definition.unique,
+                    definition.descending, definition.predicate, definition.expressions, remap(definition.include, index)));
         }
         List<ForeignKey> keys = new ArrayList<>();
         for (ForeignKey key : foreignKeys) {
@@ -401,7 +549,14 @@ final class Schema {
 
     private Schema copy(List<Column> columns, int[] primaryKey, List<UniqueKey> uniques, List<IndexDef> indexes,
                         String primaryConstraint, String primaryIndex, boolean primaryDescending, List<ForeignKey> foreignKeys) {
-        return new Schema(name, columns, primaryKey, uniques, indexes, primaryConstraint, primaryIndex, primaryDescending, foreignKeys);
+        return copy(columns, primaryKey, uniques, indexes, primaryConstraint, primaryIndex, primaryDescending, foreignKeys, checks);
+    }
+
+    private Schema copy(List<Column> columns, int[] primaryKey, List<UniqueKey> uniques, List<IndexDef> indexes,
+                        String primaryConstraint, String primaryIndex, boolean primaryDescending, List<ForeignKey> foreignKeys,
+                        List<CheckConstraint> checks) {
+        return new Schema(name, columns, primaryKey, uniques, indexes, primaryConstraint, primaryIndex, primaryDescending,
+                foreignKeys, checks);
     }
 
     private static int[] remapMove(int[] indexes, int from, int to) {
@@ -469,7 +624,9 @@ final class Schema {
             IndexDef one = indexes.get(i);
             IndexDef two = other.indexes.get(i);
             if (!Names.same(one.name, two.name) || one.unique != two.unique || one.descending != two.descending
-                    || !Arrays.equals(one.columns, two.columns)) {
+                    || !Arrays.equals(one.columns, two.columns) || !Arrays.equals(one.include, two.include)
+                    || !java.util.Objects.equals(one.predicate, two.predicate)
+                    || !Arrays.equals(one.expressions, two.expressions)) {
                 return false;
             }
         }

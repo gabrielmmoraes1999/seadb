@@ -424,6 +424,7 @@ final class TransactionLog implements AutoCloseable {
     void appendCommit(long txnId) {
         ByteWriter payload = new ByteWriter();
         payload.u64(txnId);
+        payload.u64(java.time.Instant.now().toEpochMilli());
         append(Format.RECORD_COMMIT, payload.toArray());
     }
 
@@ -485,7 +486,9 @@ final class TransactionLog implements AutoCloseable {
                 } else if (at >= checkpointLsn && type == Format.RECORD_UNDO) {
                     TxnUndo undo = decodeUndo(plain);
                     active.put(undo.id, undo);
-                } else if (at >= checkpointLsn && (type == Format.RECORD_COMMIT || type == Format.RECORD_ROLLBACK)) {
+                } else if (at >= checkpointLsn && type == Format.RECORD_ROLLBACK) {
+                    active.remove(readTxnId(plain));
+                } else if (at >= checkpointLsn && type == Format.RECORD_COMMIT && keepCommit(plain)) {
                     active.remove(readTxnId(plain));
                 }
             }
@@ -623,6 +626,7 @@ final class TransactionLog implements AutoCloseable {
         List<Batch> held = new ArrayList<>();
         List<Long> heldAt = new ArrayList<>();
         Map<Long, List<Long>> openSql = new LinkedHashMap<>();
+        boolean skipSql = false;
         long at = Format.LOG_HEADER_SIZE;
         while (at + 4 <= size) {
             int recordLength = readInt(at);
@@ -647,19 +651,33 @@ final class TransactionLog implements AutoCloseable {
                 throw new SeaException("transaction log is corrupt");
             }
             if (type == Format.RECORD_TRANSACTION && at >= from) {
-                held.add(new Batch(at + recordLength, decodeTransaction(readable(record))));
-                heldAt.add(at);
+                if (!skipSql) {
+                    held.add(new Batch(at + recordLength, decodeTransaction(readable(record))));
+                    heldAt.add(at);
+                }
             } else if (type == Format.RECORD_TXN_SQL && at >= from) {
                 long id = txnSqlId(readable(record));
                 openSql.computeIfAbsent(id, key -> new ArrayList<>()).add(at);
             } else if (type == Format.RECORD_COMMIT) {
-                long id = readTxnId(readable(record));
-                emitTxn(consumer, openSql.remove(id));
+                byte[] plain = readable(record);
+                long id = readTxnId(plain);
+                List<Long> mine = openSql.remove(id);
+                skipSql = !keepCommit(plain);
+                if (!skipSql) {
+                    emitTxn(consumer, mine);
+                }
             } else if (type == Format.RECORD_ROLLBACK) {
                 long id = readTxnId(readable(record));
                 openSql.remove(id);
+                skipSql = false;
             } else if (type == Format.RECORD_REDO) {
-                emitHeld(consumer, held, heldAt);
+                if (skipSql) {
+                    held.clear();
+                    heldAt.clear();
+                    skipSql = false;
+                } else {
+                    emitHeld(consumer, held, heldAt);
+                }
             }
             at += recordLength;
             if (seen != null) {
@@ -732,9 +750,10 @@ final class TransactionLog implements AutoCloseable {
                 long id = txnSqlId(readable(record));
                 openSql.computeIfAbsent(id, key -> new ArrayList<>()).add(at);
             } else if (type == Format.RECORD_COMMIT && at >= from) {
-                long id = readTxnId(readable(record));
+                byte[] plain = readable(record);
+                long id = readTxnId(plain);
                 List<Long> mine = openSql.remove(id);
-                if (mine != null) {
+                if (mine != null && keepCommit(plain)) {
                     staged.addAll(mine);
                 }
             } else if (type == Format.RECORD_ROLLBACK && at >= from) {
@@ -1437,10 +1456,25 @@ final class TransactionLog implements AutoCloseable {
     private static long readTxnId(byte[] record) {
         ByteBuffer buffer = payload(record);
         long id = readLong(buffer);
-        if (buffer.remaining() != 0) {
+        int extra = buffer.remaining();
+        if (extra != 0 && extra != 8) {
             throw new SeaException("transaction log is corrupt");
         }
         return id;
+    }
+
+    private static boolean keepCommit(byte[] record) {
+        java.time.Instant cut = ReplayCut.until();
+        if (cut == null) {
+            return true;
+        }
+        ByteBuffer buffer = payload(record);
+        readLong(buffer);
+        if (buffer.remaining() != 8) {
+            return true;
+        }
+        java.time.Instant when = java.time.Instant.ofEpochMilli(readLong(buffer));
+        return !when.isAfter(cut);
     }
 
     private static ByteBuffer payload(byte[] record) {
@@ -1581,6 +1615,16 @@ final class TransactionLog implements AutoCloseable {
         } else if (value instanceof java.util.Date date) {
             out.u8(17);
             out.u64(date.getTime());
+        } else if (value instanceof java.util.UUID id) {
+            out.u8(18);
+            out.utf(id.toString());
+        } else if (value instanceof SqlInterval interval) {
+            out.u8(19);
+            out.u64(interval.millis);
+        } else if (value instanceof java.time.OffsetDateTime stamp) {
+            out.u8(20);
+            out.u64(stamp.toInstant().toEpochMilli());
+            out.u32(stamp.getOffset().getTotalSeconds() / 60);
         } else if (value instanceof Short number) {
             out.u8(12);
             out.u32(number);
@@ -1675,6 +1719,10 @@ final class TransactionLog implements AutoCloseable {
             case 15 -> java.sql.Time.valueOf(LocalTime.parse(readUtf(buffer)));
             case 16 -> java.sql.Timestamp.valueOf(LocalDateTime.parse(readUtf(buffer)));
             case 17 -> new java.util.Date(readLong(buffer));
+            case 18 -> java.util.UUID.fromString(readUtf(buffer));
+            case 19 -> new SqlInterval(readLong(buffer));
+            case 20 -> java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochMilli(readLong(buffer)),
+                    java.time.ZoneOffset.ofTotalSeconds(readInt(buffer) * 60));
             default -> throw new SeaException("transaction log is corrupt");
         };
     }

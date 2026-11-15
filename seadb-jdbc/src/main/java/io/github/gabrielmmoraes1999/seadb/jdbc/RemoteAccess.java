@@ -40,7 +40,12 @@ final class RemoteAccess implements DatabaseAccess {
 
     static RemoteAccess connect(String host, int port, String database, String user, String password, String role)
             throws SQLException {
-        Socket socket = new Socket();
+        return connect(host, port, database, user, password, role, false, "");
+    }
+
+    static RemoteAccess connect(String host, int port, String database, String user, String password, String role,
+                                boolean ssl, String certificate) throws SQLException {
+        Socket socket = ssl ? secure(certificate) : new Socket();
         try {
             socket.connect(new InetSocketAddress(host, port), 10_000);
             socket.setTcpNoDelay(true);
@@ -51,7 +56,7 @@ final class RemoteAccess implements DatabaseAccess {
                     database, user, password, role, local.host(), local.osUser(), local.process()));
             Wire.Frame response = Wire.readFrame(input);
             if (response.opcode() == Wire.FAIL) {
-                throw new SQLException(Wire.decodeError(response.body()), "42000");
+                throw new SQLException(Wire.decodeError(response.body()), Wire.decodeErrorState(response.body()));
             }
             if (response.opcode() != Wire.OK) {
                 throw new SQLException("invalid response from the server", "08001");
@@ -105,11 +110,34 @@ final class RemoteAccess implements DatabaseAccess {
     }
 
     @Override
-    public SqlResult execute(String sql, Object[] params) throws SQLException {
+    public List<io.github.gabrielmmoraes1999.seadb.ParameterMeta> describeParameters(String sql) throws SQLException {
         synchronized (lock) {
             ensureOpen();
             try {
-                Wire.writeFrame(output, Wire.EXECUTE, Wire.encodeExecute(sql, params));
+                Wire.writeFrame(output, Wire.DESCRIBE_PARAMETERS, Wire.encodeDescribe(sql));
+                return Wire.decodeParameters(read().body());
+            } catch (IOException exception) {
+                throw failed(exception);
+            }
+        }
+    }
+
+    public SqlResult execute(String sql, Object[] params) throws SQLException {
+        return execute(sql, params, 0);
+    }
+
+    private volatile boolean busy;
+
+    public SqlResult execute(String sql, Object[] params, int fetch) throws SQLException {
+        return execute(sql, params, fetch, 0);
+    }
+
+    public SqlResult execute(String sql, Object[] params, int fetch, int timeoutSeconds) throws SQLException {
+        synchronized (lock) {
+            ensureOpen();
+            busy = true;
+            try {
+                Wire.writeFrame(output, Wire.EXECUTE, Wire.encodeExecute(sql, params, fetch, timeoutSeconds));
                 Wire.Frame response = read();
                 Wire.ExecuteReply reply = Wire.decodeExecuteOk(response.body());
                 schema = reply.schema();
@@ -118,6 +146,35 @@ final class RemoteAccess implements DatabaseAccess {
                 return reply.result();
             } catch (SeaException exception) {
                 throw Jdbc.wrap(exception);
+            } catch (IOException exception) {
+                throw failed(exception);
+            } finally {
+                busy = false;
+            }
+        }
+    }
+
+    public void cancel() throws SQLException {
+        ensureOpen();
+        try {
+            Wire.writeFrame(output, Wire.CANCEL, new byte[0]);
+            if (!busy) {
+                Wire.Frame response = Wire.readFrame(input);
+                if (response.opcode() == Wire.FAIL) {
+                    return;
+                }
+            }
+        } catch (IOException exception) {
+            throw failed(exception);
+        }
+    }
+
+    public SqlResult fetch(long cursor, int count) throws SQLException {
+        synchronized (lock) {
+            ensureOpen();
+            try {
+                Wire.writeFrame(output, Wire.FETCH, Wire.encodeFetch(cursor, count));
+                return Wire.decodeExecuteOk(read().body()).result();
             } catch (IOException exception) {
                 throw failed(exception);
             }
@@ -194,7 +251,7 @@ final class RemoteAccess implements DatabaseAccess {
     private Wire.Frame read() throws IOException, SQLException {
         Wire.Frame response = Wire.readFrame(input);
         if (response.opcode() == Wire.FAIL) {
-            throw new SQLException(Wire.decodeError(response.body()), "42000");
+            throw new SQLException(Wire.decodeError(response.body()), Wire.decodeErrorState(response.body()));
         }
         if (response.opcode() != Wire.OK) {
             throw new SQLException("invalid response from the server", "08001");
@@ -220,6 +277,31 @@ final class RemoteAccess implements DatabaseAccess {
 
     private static SQLException failed(IOException exception) {
         return new SQLException("connection to the server failed", "08001", exception);
+    }
+
+    private static Socket secure(String certificate) throws SQLException {
+        try {
+            java.security.cert.CertificateFactory factory = java.security.cert.CertificateFactory.getInstance("X.509");
+            java.security.cert.Certificate cert;
+            try (java.io.InputStream input = java.nio.file.Files.newInputStream(java.nio.file.Path.of(certificate))) {
+                cert = factory.generateCertificate(input);
+            }
+            java.security.KeyStore trust = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
+            trust.load(null, null);
+            trust.setCertificateEntry("server", cert);
+            javax.net.ssl.TrustManagerFactory managers = javax.net.ssl.TrustManagerFactory.getInstance(
+                    javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+            managers.init(trust);
+            javax.net.ssl.SSLContext context = javax.net.ssl.SSLContext.getInstance("TLS");
+            context.init(null, managers.getTrustManagers(), null);
+            javax.net.ssl.SSLSocket created = (javax.net.ssl.SSLSocket) context.getSocketFactory().createSocket();
+            javax.net.ssl.SSLParameters parameters = created.getSSLParameters();
+            parameters.setEndpointIdentificationAlgorithm(null);
+            created.setSSLParameters(parameters);
+            return created;
+        } catch (Exception exception) {
+            throw new SQLException("could not trust " + certificate, "08001", exception);
+        }
     }
 
     private static void closeQuietly(Socket socket) {

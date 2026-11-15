@@ -27,7 +27,7 @@ import java.util.Arrays;
 import java.util.Calendar;
 import java.util.List;
 
-final class SeaPreparedStatement extends SeaStatement implements PreparedStatement {
+class SeaPreparedStatement extends SeaStatement implements PreparedStatement {
 
     private static final Object UNSET = new Object();
 
@@ -234,7 +234,8 @@ final class SeaPreparedStatement extends SeaStatement implements PreparedStateme
 
     @Override
     public ParameterMetaData getParameterMetaData() throws SQLException {
-        throw Jdbc.unsupported("ParameterMetaData");
+        checkOpen();
+        return new SeaParameterMetaData(connection.describeParameters(sql));
     }
 
     @Override

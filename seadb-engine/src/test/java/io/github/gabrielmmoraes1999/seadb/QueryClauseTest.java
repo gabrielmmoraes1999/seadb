@@ -363,13 +363,13 @@ class QueryClauseTest {
             SqlResult view = db.query("SELECT cidade, total FROM por_cidade WHERE cidade = 'Olinda'");
             assertEquals(1L, view.rows().get(0).getLong("total"));
 
-            SeaException join = assertThrows(SeaException.class, () -> db.execute("""
+            db.execute("""
                     CREATE VIEW juntos AS
-                    SELECT c.nome
+                    SELECT c.nome AS nome
                     FROM cliente c
                     JOIN cliente d ON c.id = d.id
-                    """));
-            assertTrue(join.getMessage().contains("one table"));
+                    """);
+            assertEquals("Ana", db.query("SELECT nome FROM juntos WHERE nome = 'Ana'").rows().get(0).getString("nome"));
 
             SqlResult script = db.execute("""
                     INSERT INTO cliente (id, nome, cidade) VALUES (5, 'Eva', 'Recife');

@@ -20,6 +20,8 @@ import java.util.Set;
 
 final class SeaDatabaseMetaData implements DatabaseMetaData {
 
+    private java.util.Map<String, String> remarks;
+
     private final SeaConnection connection;
 
     SeaDatabaseMetaData(SeaConnection connection) {
@@ -418,7 +420,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public boolean supportsStoredProcedures() {
-        return false;
+        return true;
     }
 
     @Override
@@ -652,7 +654,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
             }
             short type = returns.contains(procedureKey(schema, name))
                     ? (short) procedureReturnsResult : (short) procedureNoResult;
-            rows.add(new Object[]{null, schema, name, null, null, null, null, type, name});
+            rows.add(new Object[]{null, schema, name, null, null, null, remark("PROCEDURE", schema, name, ""), type, name});
         }
         rows.sort(Comparator
                 .comparing((Object[] row) -> (String) row[1], String.CASE_INSENSITIVE_ORDER)
@@ -743,7 +745,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
                     digits == null ? null : digits.shortValue(),
                     radix == null ? null : radix.shortValue(),
                     (short) procedureNullable,
-                    null,
+                    remark("PROCEDURE", parameter.schema(), parameter.procedure(), parameter.name()),
                     null,
                     null,
                     null,
@@ -780,14 +782,16 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
                     || !wants(types, type) || !Jdbc.nameMatches(tableNamePattern, table.name())) {
                 continue;
             }
-            rows.add(new Object[]{null, table.schema(), table.name(), type, null, null, null, null, null, null});
+            rows.add(new Object[]{null, table.schema(), table.name(), type,
+                    remark("TABLE", table.schema(), table.name(), ""), null, null, null, null, null});
         }
         for (TableDescription view : views()) {
             if (!matchesSchema(schemaPattern, view.schema())
                     || !wants(types, "VIEW") || !Jdbc.nameMatches(tableNamePattern, view.name())) {
                 continue;
             }
-            rows.add(new Object[]{null, view.schema(), view.name(), "VIEW", null, null, null, null, null, null});
+            rows.add(new Object[]{null, view.schema(), view.name(), "VIEW",
+                    remark("VIEW", view.schema(), view.name(), ""), null, null, null, null, null});
         }
         return grid(columns, rows);
     }
@@ -867,7 +871,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
                         Jdbc.decimalDigits(column.type(), column.scale()),
                         Jdbc.radix(column.type()),
                         column.nullable() ? columnNullable : columnNoNulls,
-                        null,
+                        remark("COLUMN", table.schema(), column.table(), column.name()),
                         column.defaultSql(),
                         null,
                         null,
@@ -1015,6 +1019,10 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
         addType(rows, DataType.TIME, "'", "'", null, false);
         addType(rows, DataType.TIMESTAMP, "'", "'", null, false);
         addType(rows, DataType.BLOB, "X'", "'", null, false);
+        addType(rows, DataType.UUID, "'", "'", null, false);
+        addType(rows, DataType.JSON, "'", "'", null, false);
+        addType(rows, DataType.INTERVAL, "INTERVAL '", "' DAY TO SECOND", null, false);
+        addType(rows, DataType.TIMESTAMPTZ, "'", "'", null, false);
         return grid(columns, rows);
     }
 
@@ -1146,7 +1154,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public boolean supportsSavepoints() {
-        return false;
+        return true;
     }
 
     @Override
@@ -1161,7 +1169,7 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public boolean supportsGetGeneratedKeys() {
-        return false;
+        return true;
     }
 
     @Override
@@ -1407,6 +1415,32 @@ final class SeaDatabaseMetaData implements DatabaseMetaData {
             }
         }
         return false;
+    }
+
+    private String remark(String kind, String schema, String object, String column) {
+        if (remarks == null) {
+            remarks = new java.util.HashMap<>();
+            try {
+                for (Row row : catalogQuery("""
+                        SELECT SEA$KIND, SEA$SCHEMA_NAME, SEA$OBJECT_NAME, SEA$COLUMN_NAME, SEA$REMARK
+                        FROM SEA$REMARKS
+                        """).rows()) {
+                    String key = remarkKey(row.getString("SEA$KIND"), row.getString("SEA$SCHEMA_NAME"),
+                            row.getString("SEA$OBJECT_NAME"), row.getString("SEA$COLUMN_NAME"));
+                    remarks.put(key, row.getString("SEA$REMARK"));
+                }
+            } catch (SQLException ignored) {
+                remarks.clear();
+            }
+        }
+        return remarks.get(remarkKey(kind, schema, object, column));
+    }
+
+    private static String remarkKey(String kind, String schema, String object, String column) {
+        return (kind == null ? "" : kind).toLowerCase(java.util.Locale.ROOT) + "\0"
+                + (schema == null ? "" : schema).toLowerCase(java.util.Locale.ROOT) + "\0"
+                + (object == null ? "" : object).toLowerCase(java.util.Locale.ROOT) + "\0"
+                + (column == null ? "" : column).toLowerCase(java.util.Locale.ROOT);
     }
 
     private SqlResult catalogQuery(String sql) throws SQLException {

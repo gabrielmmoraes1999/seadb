@@ -13,6 +13,7 @@ final class SqlParser {
     private final List<Token> tokens = new ArrayList<>();
     private int cursor;
     private int parameters;
+    private boolean allowWindow;
 
     private SqlParser(String sql) {
         this.sql = sql;
@@ -25,6 +26,20 @@ final class SqlParser {
         SqlParser parser = new SqlParser(sql);
         parser.lex();
         return new ParsedSql(parser.script(), parser.parameters);
+    }
+
+    static Expr parseExpression(String source) {
+        if (source == null || source.isBlank()) {
+            throw new SeaException("empty expression");
+        }
+        SqlParser parser = new SqlParser(source);
+        parser.lex();
+        Expr expr = parser.expression();
+        parser.skipSemicolons();
+        if (!parser.peek(TokenKind.EOF)) {
+            throw new SeaException("text after the expression");
+        }
+        return expr;
     }
 
     static Select parseView(String source) {
@@ -52,6 +67,35 @@ final class SqlParser {
             throw new SeaException("view reads one table");
         }
         return select;
+    }
+
+    static Query parseViewQuery(String source) {
+        if (source == null || source.isBlank()) {
+            throw new SeaException("view without SELECT");
+        }
+        SqlParser parser = new SqlParser(source);
+        parser.lex();
+        if (!parser.peekKeyword("SELECT") && !parser.peekKeyword("WITH")) {
+            throw new SeaException("view expects SELECT");
+        }
+        Query body;
+        if (parser.peekKeyword("WITH")) {
+            body = parser.withQuery();
+        } else {
+            parser.expectKeyword("SELECT");
+            body = parser.selectQuery();
+        }
+        if (parser.parameters != 0) {
+            throw new SeaException("view does not accept parameters");
+        }
+        parser.skipSemicolons();
+        if (!parser.peek(TokenKind.EOF)) {
+            throw new SeaException("text after the view SELECT");
+        }
+        if (body instanceof SelectProcedure) {
+            throw new SeaException("view does not accept a procedure SELECT");
+        }
+        return body;
     }
 
     static Routine parseRoutine(String source) {
@@ -103,6 +147,9 @@ final class SqlParser {
         if (consumeKeyword("ALTER")) {
             return alter();
         }
+        if (consumeKeyword("RENAME")) {
+            return rename();
+        }
         if (consumeKeyword("INSERT")) {
             return insert();
         }
@@ -112,6 +159,12 @@ final class SqlParser {
         if (consumeKeyword("DELETE")) {
             return delete();
         }
+        if (consumeKeyword("MERGE")) {
+            return merge();
+        }
+        if (consumeKeyword("TRUNCATE")) {
+            return truncateTable();
+        }
         if (consumeKeyword("GRANT")) {
             return grant();
         }
@@ -119,12 +172,39 @@ final class SqlParser {
             return revoke();
         }
         if (consumeKeyword("SET")) {
+            if (consumeKeyword("TRANSACTION")) {
+                expectKeyword("ISOLATION");
+                expectKeyword("LEVEL");
+                return new SetIsolation(isolationLevel());
+            }
             if (consumeKeyword("SCHEMA")) {
                 return new SetSchema(expectIdent());
             }
             return setGenerator();
         }
+        if (consumeKeyword("SAVEPOINT")) {
+            return new Savepoint(expectIdent());
+        }
+        if (consumeKeyword("RELEASE")) {
+            expectKeyword("SAVEPOINT");
+            return new ReleaseSavepoint(expectIdent());
+        }
+        if (consumeKeyword("EXPLAIN")) {
+            return new Explain(statement());
+        }
+        if (consumeKeyword("COMMENT")) {
+            return commentOn();
+        }
+        if (consumeKeyword("ANALYZE")) {
+            if (peek(TokenKind.EOF) || peekSymbol(";")) {
+                return new Analyze(null);
+            }
+            return new Analyze(expectRelation());
+        }
         if (consumeKeyword("EXECUTE")) {
+            if (consumeKeyword("BLOCK")) {
+                return executeBlock();
+            }
             return executeProcedure(false);
         }
         if (consumeKeyword("WITH")) {
@@ -150,12 +230,78 @@ final class SqlParser {
         if (consumeKeyword("ROLLBACK")) {
             optionalKeyword("TRANSACTION");
             optionalKeyword("WORK");
+            if (consumeKeyword("TO")) {
+                optionalKeyword("SAVEPOINT");
+                return new RollbackTo(expectIdent());
+            }
             return new RollbackTx();
         }
         throw error("unrecognized SQL statement");
     }
 
+    private Stmt commentOn() {
+        expectKeyword("ON");
+        String kind;
+        if (consumeKeyword("TABLE")) {
+            kind = "TABLE";
+        } else if (consumeKeyword("COLUMN")) {
+            kind = "COLUMN";
+        } else if (consumeKeyword("VIEW")) {
+            kind = "VIEW";
+        } else if (consumeKeyword("PROCEDURE")) {
+            kind = "PROCEDURE";
+        } else if (consumeKeyword("FUNCTION")) {
+            kind = "FUNCTION";
+        } else if (consumeKeyword("INDEX")) {
+            kind = "INDEX";
+        } else if (consumeKeyword("SCHEMA")) {
+            kind = "SCHEMA";
+        } else {
+            throw error("COMMENT ON expects TABLE, COLUMN, VIEW, PROCEDURE, FUNCTION, INDEX, or SCHEMA");
+        }
+        String schema = null;
+        String name;
+        String column = "";
+        if (kind.equals("COLUMN")) {
+            String first = expectIdent();
+            expectSymbol(".");
+            String second = expectIdent();
+            if (consumeSymbol(".")) {
+                schema = first;
+                name = second;
+                column = expectIdent();
+            } else {
+                name = first;
+                column = second;
+            }
+        } else {
+            String first = expectIdent();
+            if (consumeSymbol(".")) {
+                schema = first;
+                name = expectIdent();
+            } else {
+                name = first;
+            }
+        }
+        expectKeyword("IS");
+        String text = null;
+        if (!consumeKeyword("NULL")) {
+            Expr expr = expression();
+            if (!(expr instanceof Literal literal) || !(literal.value() instanceof String value)) {
+                throw error("comment text is required");
+            }
+            if (value.isEmpty()) {
+                throw error("comment text is empty");
+            }
+            text = value;
+        }
+        return new Comment(kind, schema, name, column, text);
+    }
+
     private Stmt grant() {
+        if (peekKeyword("EXECUTE")) {
+            return grantExecute(true);
+        }
         if (!peekPrivilege()) {
             String role = expectIdent();
             expectKeyword("TO");
@@ -168,7 +314,7 @@ final class SqlParser {
             }
             return new GrantRole(role, user, adminOption);
         }
-        List<String> privileges = privilegeList();
+        PrivilegeGrant privileges = privilegeGrant();
         expectKeyword("ON");
         if (!consumeKeyword("TABLE")) {
             consumeKeyword("VIEW");
@@ -182,10 +328,13 @@ final class SqlParser {
             expectKeyword("OPTION");
             grantOption = true;
         }
-        return new Grant(privileges, table, user, grantOption);
+        return new Grant(privileges.names, table, user, grantOption, privileges.columns);
     }
 
     private Stmt revoke() {
+        if (peekKeyword("EXECUTE")) {
+            return grantExecute(false);
+        }
         if (consumeKeyword("ADMIN")) {
             expectKeyword("OPTION");
             expectKeyword("FOR");
@@ -198,7 +347,7 @@ final class SqlParser {
             expectKeyword("FROM");
             return new RevokeRole(role, expectIdent(), false);
         }
-        List<String> privileges = privilegeList();
+        PrivilegeGrant privileges = privilegeGrant();
         expectKeyword("ON");
         if (!consumeKeyword("TABLE")) {
             consumeKeyword("VIEW");
@@ -206,7 +355,42 @@ final class SqlParser {
         String table = expectRelation();
         expectKeyword("FROM");
         String user = expectIdent();
-        return new Revoke(privileges, table, user);
+        return new Revoke(privileges.names, table, user, privileges.columns);
+    }
+
+    private PrivilegeGrant privilegeGrant() {
+        if (consumeKeyword("ALL")) {
+            optionalKeyword("PRIVILEGES");
+            if (peekSymbol("(")) {
+                throw error("ALL does not accept a column list");
+            }
+            return new PrivilegeGrant(new ArrayList<>(SystemTables.DML), List.of());
+        }
+        List<String> privileges = new ArrayList<>();
+        List<String> columns = List.of();
+        do {
+            String privilege = privilegeName();
+            if (privileges.stream().anyMatch(item -> item.equals(privilege))) {
+                throw error("duplicate privilege: " + privilege);
+            }
+            if (peekSymbol("(")) {
+                if (privilege.equals("DELETE")) {
+                    throw error("DELETE does not accept a column list");
+                }
+                if (!columns.isEmpty()) {
+                    throw error("column list applies to one privilege");
+                }
+                columns = nameList();
+            }
+            privileges.add(privilege);
+        } while (consumeSymbol(","));
+        if (!columns.isEmpty() && privileges.size() != 1) {
+            throw error("column list applies to one privilege");
+        }
+        return new PrivilegeGrant(privileges, columns);
+    }
+
+    private record PrivilegeGrant(List<String> names, List<String> columns) {
     }
 
     private List<String> privilegeList() {
@@ -246,21 +430,105 @@ final class SqlParser {
         throw error("expected privilege: SELECT, INSERT, UPDATE, DELETE, or ALL");
     }
 
+    private Stmt grantExecute(boolean grant) {
+        expectKeyword("EXECUTE");
+        expectKeyword("ON");
+        String kind;
+        if (consumeKeyword("FUNCTION")) {
+            kind = "FUNCTION";
+        } else {
+            expectKeyword("PROCEDURE");
+            kind = "PROCEDURE";
+        }
+        String name = expectRelation();
+        expectKeyword(grant ? "TO" : "FROM");
+        String user = expectIdent();
+        return grant ? new GrantExecute(kind, name, user) : new RevokeExecute(kind, name, user);
+    }
+
+    private Stmt rename() {
+        if (consumeKeyword("TABLE")) {
+            String table = expectRelation();
+            expectKeyword("TO");
+            return new RenameTable(table, expectRelation());
+        }
+        expectKeyword("COLUMN");
+        String table = expectRelation();
+        if (!consumeSymbol(".")) {
+            throw error("RENAME COLUMN requires table.column");
+        }
+        String column = expectIdent();
+        expectKeyword("TO");
+        return new RenameColumn(table, column, expectIdent());
+    }
+
+    private Stmt executeBlock() {
+        List<ParamDef> inputs = new ArrayList<>();
+        List<Expr> defaults = new ArrayList<>();
+        if (peekSymbol("(")) {
+            expectSymbol("(");
+            if (!peekSymbol(")")) {
+                do {
+                    String name = expectIdent();
+                    TypeSpec type = parseType();
+                    expectSymbol("=");
+                    defaults.add(expression());
+                    inputs.add(new ParamDef(name, type.type, type.length, type.scale));
+                } while (consumeSymbol(","));
+            }
+            expectSymbol(")");
+        }
+        List<ParamDef> outputs = List.of();
+        if (consumeKeyword("RETURNS")) {
+            outputs = parameterList(true);
+        }
+        expectKeyword("AS");
+        String source = captureRoutine();
+        parseRoutine(source);
+        return new ExecuteBlock(inputs, defaults, outputs, source);
+    }
+
     private Stmt create() {
+        boolean orReplace = false;
+        if (consumeKeyword("OR")) {
+            expectKeyword("REPLACE");
+            orReplace = true;
+        }
         if (consumeKeyword("GENERATOR")) {
+            if (orReplace) {
+                throw error("OR REPLACE applies to VIEW, PROCEDURE, or FUNCTION");
+            }
             return createGenerator(false);
         }
         if (consumeKeyword("SEQUENCE")) {
+            if (orReplace) {
+                throw error("OR REPLACE applies to VIEW, PROCEDURE, or FUNCTION");
+            }
             return createGenerator(true);
         }
         if (consumeKeyword("PROCEDURE")) {
-            return createProcedure();
+            return createProcedure(orReplace);
+        }
+        if (consumeKeyword("FUNCTION")) {
+            return createFunction(orReplace);
+        }
+        if (consumeKeyword("DOMAIN")) {
+            if (orReplace) {
+                throw error("OR REPLACE applies to VIEW, PROCEDURE, or FUNCTION");
+            }
+            return createDomain();
         }
         if (consumeKeyword("TRIGGER")) {
+            if (orReplace) {
+                throw error("OR REPLACE applies to VIEW, PROCEDURE, or FUNCTION");
+            }
             return createTrigger();
         }
         if (consumeKeyword("VIEW")) {
-            return createView();
+            return createView(orReplace);
+        }
+        if (orReplace) {
+            throw error("OR REPLACE applies to VIEW, PROCEDURE, or FUNCTION");
         }
         if (consumeKeyword("ROLE")) {
             return new CreateRole(ifNotExists(), expectIdent());
@@ -303,10 +571,11 @@ final class SqlParser {
             throw error("CREATE TABLE requires at least one column");
         }
         return new CreateTable(ifNotExists, name, columns, primary, List.copyOf(keys.uniques),
-                keys.primaryConstraint, keys.primaryIndex, keys.primaryDescending, List.copyOf(keys.foreignKeys));
+                keys.primaryConstraint, keys.primaryIndex, keys.primaryDescending, List.copyOf(keys.foreignKeys),
+                List.copyOf(keys.checks));
     }
 
-    private Stmt createView() {
+    private Stmt createView(boolean orReplace) {
         boolean ifNotExists = false;
         if (consumeKeyword("IF")) {
             expectKeyword("NOT");
@@ -316,27 +585,29 @@ final class SqlParser {
         String name = expectRelation();
         List<String> columns = peekSymbol("(") ? columnList() : List.of();
         expectKeyword("AS");
-        if (!peekKeyword("SELECT")) {
+        if (!peekKeyword("SELECT") && !peekKeyword("WITH")) {
             throw error("CREATE VIEW expects SELECT");
         }
         int start = current().start;
         int before = parameters;
-        expectKeyword("SELECT");
-        Query body = selectQuery();
+        Query body;
+        if (peekKeyword("WITH")) {
+            body = withQuery();
+        } else {
+            expectKeyword("SELECT");
+            body = selectQuery();
+        }
         if (parameters != before) {
             throw error("CREATE VIEW does not accept parameters");
         }
         if (body instanceof SelectProcedure) {
             throw error("CREATE VIEW does not accept a procedure SELECT");
         }
-        if (!(body instanceof Select select) || !select.joins().isEmpty()) {
-            throw error("CREATE VIEW reads one table");
-        }
-        if (select.star() && !select.groupBy().isEmpty()) {
+        if (body instanceof Select select && select.star() && !select.groupBy().isEmpty()) {
             throw error("SELECT * cannot be combined with GROUP BY");
         }
         int end = tokens.get(cursor - 1).end;
-        return new CreateView(ifNotExists, name, columns, sql.substring(start, end).trim());
+        return new CreateView(orReplace, ifNotExists, name, columns, sql.substring(start, end).trim());
     }
 
     private Stmt createIndex(boolean unique) {
@@ -349,7 +620,52 @@ final class SqlParser {
         String name = expectIdent();
         expectKeyword("ON");
         String table = expectRelation();
-        return new CreateIndex(unique, ifNotExists, name, table, columnList());
+        List<String> keys = indexKeys();
+        List<String> include = List.of();
+        String predicate = null;
+        boolean descending = false;
+        boolean direction = false;
+        while (true) {
+            if (include.isEmpty() && consumeKeyword("INCLUDE")) {
+                include = columnList();
+                continue;
+            }
+            if (predicate == null && consumeKeyword("WHERE")) {
+                predicate = captureExpression();
+                continue;
+            }
+            if (!direction && (consumeKeyword("DESCENDING") || consumeKeyword("DESC"))) {
+                descending = true;
+                direction = true;
+                continue;
+            }
+            if (!direction && (consumeKeyword("ASCENDING") || consumeKeyword("ASC"))) {
+                direction = true;
+                continue;
+            }
+            break;
+        }
+        return new CreateIndex(unique, ifNotExists, name, table, keys, include, predicate, descending);
+    }
+
+    private List<String> indexKeys() {
+        expectSymbol("(");
+        List<String> keys = new ArrayList<>();
+        do {
+            keys.add(captureExpression());
+        } while (consumeSymbol(","));
+        expectSymbol(")");
+        if (keys.isEmpty()) {
+            throw error("the column list is empty");
+        }
+        return keys;
+    }
+
+    private String captureExpression() {
+        int start = current().start;
+        expression();
+        int end = tokens.get(cursor - 1).end;
+        return sql.substring(start, end).trim();
     }
 
     private void tableConstraint(List<String> primary, TableKeys keys) {
@@ -379,6 +695,15 @@ final class SqlParser {
             Using using = usingIndex();
             keys.foreignKeys.add(new ForeignClause(name, columns, using.name, using.descending, refTable, refColumns,
                     actions.onUpdate, actions.onDelete));
+            return;
+        }
+        if (consumeKeyword("CHECK")) {
+            expectSymbol("(");
+            int start = current().start;
+            expression();
+            String source = sql.substring(start, tokens.get(cursor - 1).end).trim();
+            expectSymbol(")");
+            keys.checks.add(new CheckSpec(name, null, source));
             return;
         }
         expectKeyword("UNIQUE");
@@ -466,6 +791,7 @@ final class SqlParser {
         private boolean primaryDescending;
         private final List<UniqueClause> uniques = new ArrayList<>();
         private final List<ForeignClause> foreignKeys = new ArrayList<>();
+        private final List<CheckSpec> checks = new ArrayList<>();
     }
 
     private record Using(String name, boolean descending) {
@@ -477,6 +803,12 @@ final class SqlParser {
         }
         if (consumeKeyword("PROCEDURE")) {
             return new DropProcedure(ifExists(), expectRelation());
+        }
+        if (consumeKeyword("FUNCTION")) {
+            return new DropFunction(ifExists(), expectRelation());
+        }
+        if (consumeKeyword("DOMAIN")) {
+            return new DropDomain(ifExists(), expectRelation());
         }
         if (consumeKeyword("TRIGGER")) {
             return new DropTrigger(ifExists(), expectIdent());
@@ -513,7 +845,7 @@ final class SqlParser {
             return new DropIndex(ifExists, name, table);
         }
         if (!peekKeyword("TABLE")) {
-            throw error("DROP supports TABLE, INDEX, SCHEMA, GENERATOR, SEQUENCE, PROCEDURE, TRIGGER, VIEW, ROLE, and CONNECTION");
+            throw error("DROP supports TABLE, INDEX, SCHEMA, GENERATOR, SEQUENCE, PROCEDURE, FUNCTION, DOMAIN, TRIGGER, VIEW, ROLE, and CONNECTION");
         }
         expectKeyword("TABLE");
         boolean ifExists = false;
@@ -543,6 +875,15 @@ final class SqlParser {
         }
         expectKeyword("TABLE");
         String table = expectRelation();
+        if (consumeKeyword("RENAME")) {
+            if (consumeKeyword("COLUMN")) {
+                String column = expectIdent();
+                expectKeyword("TO");
+                return new RenameColumn(table, column, expectIdent());
+            }
+            expectKeyword("TO");
+            return new RenameTable(table, expectRelation());
+        }
         if (consumeKeyword("ADD")) {
             if (peekKeyword("CONSTRAINT") || peekKeyword("PRIMARY") || peekKeyword("FOREIGN")
                     || (peekKeyword("UNIQUE") && peekSymbol(1, "("))) {
@@ -572,16 +913,49 @@ final class SqlParser {
         if (consumeKeyword("ALTER")) {
             optionalKeyword("COLUMN");
             String column = expectIdent();
-            if (!consumeKeyword("POSITION")) {
-                throw error("ALTER COLUMN supports POSITION");
+            if (consumeKeyword("POSITION")) {
+                long raw = signedLong("POSITION");
+                if (raw > Integer.MAX_VALUE) {
+                    throw error("POSITION is too large");
+                }
+                return new AlterColumnPosition(table, column, (int) raw);
             }
-            long raw = signedLong("POSITION");
-            if (raw > Integer.MAX_VALUE) {
-                throw error("POSITION is too large");
+            if (peekKeyword("SET") && peekKeyword(1, "DATA")) {
+                consumeKeyword("SET");
+                consumeKeyword("DATA");
+                expectKeyword("TYPE");
+                TypeSpec type = parseType();
+                return new AlterColumnType(table, column, type.type, type.length, type.scale);
             }
-            return new AlterColumnPosition(table, column, (int) raw);
+            if (consumeKeyword("TYPE")) {
+                TypeSpec type = parseType();
+                return new AlterColumnType(table, column, type.type, type.length, type.scale);
+            }
+            if (consumeKeyword("SET")) {
+                if (consumeKeyword("NOT")) {
+                    expectKeyword("NULL");
+                    return new AlterColumnNull(table, column, true);
+                }
+                expectKeyword("DEFAULT");
+                int start = current().start;
+                if (peekLiteralDefault()) {
+                    parseDefault();
+                } else {
+                    expression();
+                }
+                return new AlterColumnDefault(table, column, sql.substring(start, tokens.get(cursor - 1).end).trim());
+            }
+            if (consumeKeyword("DROP")) {
+                if (consumeKeyword("NOT")) {
+                    expectKeyword("NULL");
+                    return new AlterColumnNull(table, column, false);
+                }
+                expectKeyword("DEFAULT");
+                return new AlterColumnDefault(table, column, null);
+            }
+            throw error("ALTER COLUMN supports POSITION, TYPE, SET, and DROP");
         }
-        throw error("ALTER TABLE supports ADD COLUMN, DROP COLUMN, ALTER COLUMN POSITION, and ADD and DROP of PRIMARY KEY, FOREIGN KEY, UNIQUE, and CONSTRAINT");
+        throw error("ALTER TABLE supports ADD, DROP, ALTER COLUMN, and RENAME");
     }
 
     private Stmt addTableConstraint(String table) {
@@ -613,7 +987,15 @@ final class SqlParser {
             }
             return new AddUnique(table, columns, name);
         }
-        throw error("ADD CONSTRAINT expects PRIMARY KEY, FOREIGN KEY, or UNIQUE");
+        if (consumeKeyword("CHECK")) {
+            expectSymbol("(");
+            int start = current().start;
+            expression();
+            String source = sql.substring(start, tokens.get(cursor - 1).end).trim();
+            expectSymbol(")");
+            return new AddCheck(table, name, null, source);
+        }
+        throw error("ADD CONSTRAINT expects PRIMARY KEY, FOREIGN KEY, UNIQUE, or CHECK");
     }
 
     private Stmt setGenerator() {
@@ -641,7 +1023,7 @@ final class SqlParser {
         return new CreateGenerator(name, start, increment, sequence);
     }
 
-    private Stmt createProcedure() {
+    private Stmt createProcedure(boolean orReplace) {
         String name = expectRelation();
         List<ParamDef> inputs = parameterList(false);
         List<ParamDef> outputs = List.of();
@@ -651,7 +1033,62 @@ final class SqlParser {
         expectKeyword("AS");
         String source = captureRoutine();
         parseRoutine(source);
-        return new CreateProcedure(name, inputs, outputs, source);
+        return new CreateProcedure(orReplace, name, inputs, outputs, source);
+    }
+
+    private Stmt createFunction(boolean orReplace) {
+        String name = expectRelation();
+        List<ParamDef> inputs = parameterList(false);
+        expectKeyword("RETURNS");
+        TypeSpec type = parseType();
+        expectKeyword("AS");
+        String source = captureRoutine();
+        Routine routine = parseRoutine(source);
+        if (containsSuspend(routine.body())) {
+            throw error("SUSPEND can only be used in a procedure");
+        }
+        return new CreateFunction(orReplace, name, inputs, type.type, type.length, type.scale, source);
+    }
+
+    private Stmt createDomain() {
+        String name = expectRelation();
+        expectKeyword("AS");
+        TypeSpec type = parseType();
+        if (type.domain != null) {
+            throw error("a domain cannot be based on a domain");
+        }
+        String defaultSource = null;
+        if (consumeKeyword("DEFAULT")) {
+            int start = current().start;
+            if (peekLiteralDefault()) {
+                parseDefault();
+            } else {
+                expression();
+            }
+            defaultSource = sql.substring(start, tokens.get(cursor - 1).end).trim();
+        }
+        String check = null;
+        if (consumeKeyword("CHECK")) {
+            expectSymbol("(");
+            int start = current().start;
+            expression();
+            check = sql.substring(start, tokens.get(cursor - 1).end).trim();
+            expectSymbol(")");
+        }
+        return new CreateDomain(name, type.type, type.length, type.scale, defaultSource, check);
+    }
+
+    private static boolean containsSuspend(Psql statement) {
+        return switch (statement) {
+            case PsqlSuspend ignored -> true;
+            case PsqlBlock block -> block.statements().stream().anyMatch(SqlParser::containsSuspend)
+                    || block.handlers().stream().anyMatch(handler -> containsSuspend(handler.body()));
+            case PsqlIf condition -> containsSuspend(condition.thenBranch())
+                    || (condition.elseBranch() != null && containsSuspend(condition.elseBranch()));
+            case PsqlWhile loop -> containsSuspend(loop.body());
+            case PsqlForSelect loop -> containsSuspend(loop.body());
+            default -> false;
+        };
     }
 
     private Stmt createTrigger() {
@@ -667,6 +1104,9 @@ final class SqlParser {
         String phase;
         if (consumeKeyword("BEFORE")) {
             phase = "BEFORE";
+        } else if (consumeKeyword("INSTEAD")) {
+            expectKeyword("OF");
+            phase = "INSTEAD OF";
         } else {
             expectKeyword("AFTER");
             phase = "AFTER";
@@ -789,7 +1229,7 @@ final class SqlParser {
         while (consumeSymbol(";")) {
             // empty statement
         }
-        while (!peekKeyword("END")) {
+        while (!peekKeyword("END") && !peekKeyword("WHEN")) {
             statements.add(psqlStatement());
             if (peekKeyword("END")) {
                 break;
@@ -806,8 +1246,22 @@ final class SqlParser {
             }
             expectSymbol(";");
         }
+        List<PsqlHandler> handlers = new ArrayList<>();
+        while (consumeKeyword("WHEN")) {
+            boolean any = consumeKeyword("ANY");
+            if (!any) {
+                expectKeyword("EXCEPTION");
+            }
+            expectKeyword("INTO");
+            String variable = expectIdent();
+            expectKeyword("DO");
+            handlers.add(new PsqlHandler(any, variable, psqlStatement()));
+            while (consumeSymbol(";")) {
+                // empty statement between handlers
+            }
+        }
         expectKeyword("END");
-        return new PsqlBlock(statements);
+        return new PsqlBlock(statements, handlers);
     }
 
     private Psql psqlStatement() {
@@ -842,6 +1296,9 @@ final class SqlParser {
         if (consumeKeyword("SUSPEND")) {
             return new PsqlSuspend();
         }
+        if (consumeKeyword("RETURN")) {
+            return new PsqlReturn(expression());
+        }
         if (consumeKeyword("EXCEPTION")) {
             return new PsqlException(expression());
         }
@@ -855,6 +1312,9 @@ final class SqlParser {
             return new PsqlDelete(delete());
         }
         if (consumeKeyword("EXECUTE")) {
+            if (consumeKeyword("STATEMENT")) {
+                return executeStatement();
+            }
             return new PsqlExecute((ExecuteProcedure) executeProcedure(true));
         }
         if (consumeKeyword("OPEN")) {
@@ -1016,42 +1476,166 @@ final class SqlParser {
         if (peekSymbol("(")) {
             columns = nameList();
         }
-        if (peekKeyword("SELECT")) {
-            throw error("INSERT ... SELECT is not supported");
-        }
-        expectKeyword("VALUES");
+        Query source = null;
         List<List<Expr>> rows = new ArrayList<>();
-        do {
-            expectSymbol("(");
-            List<Expr> values = new ArrayList<>();
-            if (!peekSymbol(")")) {
-                do {
-                    values.add(expression());
-                } while (consumeSymbol(","));
+        if (peekKeyword("SELECT") || peekKeyword("WITH")) {
+            source = nestedQuery();
+        } else {
+            expectKeyword("VALUES");
+            do {
+                expectSymbol("(");
+                List<Expr> values = new ArrayList<>();
+                if (!peekSymbol(")")) {
+                    do {
+                        values.add(expression());
+                    } while (consumeSymbol(","));
+                }
+                expectSymbol(")");
+                if (values.isEmpty()) {
+                    throw error("VALUES requires at least one value");
+                }
+                rows.add(values);
+            } while (consumeSymbol(","));
+        }
+        List<String> conflict = null;
+        List<Assignment> conflictSets = null;
+        boolean doNothing = false;
+        if (consumeKeyword("ON")) {
+            expectKeyword("CONFLICT");
+            conflict = nameList();
+            expectKeyword("DO");
+            if (consumeKeyword("NOTHING")) {
+                doNothing = true;
+            } else {
+                expectKeyword("UPDATE");
+                expectKeyword("SET");
+                conflictSets = assignments();
             }
-            expectSymbol(")");
-            if (values.isEmpty()) {
-                throw error("VALUES requires at least one value");
-            }
-            rows.add(values);
-        } while (consumeSymbol(","));
-        return new Insert(table, columns, rows);
+        }
+        Returning returning = returningClause();
+        return new Insert(table, columns, rows, source, conflict, conflictSets, doNothing, returning.all, returning.items);
     }
 
-    private Update update() {
-        String table = expectRelation();
-        expectKeyword("SET");
+    private Truncate truncateTable() {
+        expectKeyword("TABLE");
+        return new Truncate(expectRelation());
+    }
+
+    private Merge merge() {
+        expectKeyword("INTO");
+        String target = expectRelation();
+        String targetAlias = null;
+        if (!peekKeyword("USING")) {
+            targetAlias = expectIdent();
+        }
+        expectKeyword("USING");
+        String source = null;
+        String sourceAlias = null;
+        Query sourceQuery = null;
+        if (consumeSymbol("(")) {
+            sourceQuery = nestedQuery();
+            expectSymbol(")");
+            sourceAlias = expectIdent();
+        } else {
+            source = expectRelation();
+            if (!peekKeyword("ON")) {
+                sourceAlias = expectIdent();
+            }
+        }
+        expectKeyword("ON");
+        Expr on = expression();
+        Expr matchedWhen = null;
+        List<Assignment> sets = null;
+        Expr notMatchedWhen = null;
+        List<String> insertColumns = null;
+        List<Expr> insertValues = null;
+        if (!peekKeyword("WHEN")) {
+            throw error("MERGE requires WHEN MATCHED or WHEN NOT MATCHED");
+        }
+        while (peekKeyword("WHEN")) {
+            consumeKeyword("WHEN");
+            if (consumeKeyword("MATCHED")) {
+                if (sets != null) {
+                    throw error("WHEN MATCHED is repeated");
+                }
+                if (consumeKeyword("AND")) {
+                    matchedWhen = expression();
+                }
+                expectKeyword("THEN");
+                expectKeyword("UPDATE");
+                expectKeyword("SET");
+                sets = assignments();
+            } else {
+                expectKeyword("NOT");
+                expectKeyword("MATCHED");
+                if (insertValues != null) {
+                    throw error("WHEN NOT MATCHED is repeated");
+                }
+                if (consumeKeyword("AND")) {
+                    notMatchedWhen = expression();
+                }
+                expectKeyword("THEN");
+                expectKeyword("INSERT");
+                if (peekSymbol("(")) {
+                    insertColumns = nameList();
+                }
+                expectKeyword("VALUES");
+                expectSymbol("(");
+                insertValues = new ArrayList<>();
+                if (!peekSymbol(")")) {
+                    do {
+                        insertValues.add(expression());
+                    } while (consumeSymbol(","));
+                }
+                expectSymbol(")");
+                if (insertValues.isEmpty()) {
+                    throw error("VALUES requires at least one value");
+                }
+            }
+        }
+        return new Merge(target, targetAlias, source, sourceAlias, sourceQuery, on, matchedWhen, sets, notMatchedWhen, insertColumns, insertValues);
+    }
+
+    private List<Assignment> assignments() {
         List<Assignment> sets = new ArrayList<>();
         do {
             String column = expectIdent();
             expectSymbol("=");
             sets.add(new Assignment(column, expression()));
         } while (consumeSymbol(","));
+        return sets;
+    }
+
+    private Returning returningClause() {
+        if (!consumeKeyword("RETURNING")) {
+            return new Returning(false, null);
+        }
+        if (consumeSymbol("*")) {
+            return new Returning(true, List.of());
+        }
+        List<SelectItem> items = new ArrayList<>();
+        do {
+            Expr expr = expression();
+            String alias = null;
+            if (consumeKeyword("AS")) {
+                alias = expectIdent();
+            }
+            String label = alias != null ? alias : expr instanceof ColumnRef column ? column.name() : "column";
+            items.add(new SelectItem(expr, alias, label));
+        } while (consumeSymbol(","));
+        return new Returning(false, items);
+    }
+
+    private Update update() {
+        String table = expectRelation();
+        expectKeyword("SET");
+        List<Assignment> sets = assignments();
         Expr where = null;
         if (consumeKeyword("WHERE")) {
             where = expression();
         }
-        return new Update(table, sets, where);
+        Returning returning = returningClause();
+        return new Update(table, sets, where, returning.all, returning.items);
     }
 
     private Delete delete() {
@@ -1061,7 +1645,8 @@ final class SqlParser {
         if (consumeKeyword("WHERE")) {
             where = expression();
         }
-        return new Delete(table, where);
+        Returning returning = returningClause();
+        return new Delete(table, where, returning.all, returning.items);
     }
 
     private Stmt asStatement(Query query) {
@@ -1076,11 +1661,19 @@ final class SqlParser {
     private Query selectQuery() {
         Query head = selectBody();
         Query combined = head;
-        while (peekKeyword("UNION")) {
-            consumeKeyword("UNION");
+        while (peekKeyword("UNION") || peekKeyword("EXCEPT") || peekKeyword("INTERSECT")) {
+            SetOp op;
+            if (consumeKeyword("UNION")) {
+                op = SetOp.UNION;
+            } else if (consumeKeyword("EXCEPT")) {
+                op = SetOp.EXCEPT;
+            } else {
+                expectKeyword("INTERSECT");
+                op = SetOp.INTERSECT;
+            }
             boolean all = consumeKeyword("ALL");
             expectKeyword("SELECT");
-            combined = new UnionQuery(combined, all, selectBody(), List.of(), null, null);
+            combined = new UnionQuery(combined, op, all, selectBody(), List.of(), null, null);
         }
         return applyTail(combined, readTail());
     }
@@ -1225,7 +1818,10 @@ final class SqlParser {
                     continue;
                 }
                 int start = current().start;
+                boolean windows = allowWindow;
+                allowWindow = true;
                 Expr expr = expression();
+                allowWindow = windows;
                 String alias = null;
                 if (consumeKeyword("AS")) {
                     alias = expectIdent();
@@ -1287,7 +1883,13 @@ final class SqlParser {
                     procedureGroup, procedureHaving, List.of(), null, null);
         }
         String alias = readAlias();
-        List<Join> joins = readJoins();
+        List<Join> joins = new ArrayList<>();
+        while (consumeSymbol(",")) {
+            String relation = expectRelation();
+            String joinAlias = readAlias();
+            joins.add(new Join(JoinKind.CROSS, relation, joinAlias, null));
+        }
+        joins.addAll(readJoins());
         Expr where = null;
         if (consumeKeyword("WHERE")) {
             where = expression();
@@ -1298,13 +1900,16 @@ final class SqlParser {
     }
 
     private Query applyTail(Query query, Tail tail) {
+        if (query instanceof Select select && select.star() && containsWindow(tail.order)) {
+            throw error("SELECT * cannot be combined with a window function");
+        }
         return switch (query) {
             case Select select -> new Select(select.distinct(), select.star(), select.items(), select.table(), select.alias(),
                     select.joins(), select.where(), select.groupBy(), select.having(), tail.order, tail.limit, tail.offset);
             case SelectProcedure procedure -> new SelectProcedure(procedure.distinct(), procedure.star(), procedure.items(),
                     procedure.procedure(), procedure.arguments(), procedure.alias(), procedure.where(),
                     procedure.groupBy(), procedure.having(), tail.order, tail.limit, tail.offset);
-            case UnionQuery union -> new UnionQuery(union.left(), union.all(), union.right(), tail.order, tail.limit, tail.offset);
+            case UnionQuery union -> new UnionQuery(union.left(), union.op(), union.all(), union.right(), tail.order, tail.limit, tail.offset);
             case WithQuery with -> throw error("WITH cannot follow SELECT");
         };
     }
@@ -1312,18 +1917,16 @@ final class SqlParser {
     private List<Join> readJoins() {
         List<Join> joins = new ArrayList<>();
         while (isJoinStart() || peekKeyword("NATURAL") || peekKeyword("OUTER")) {
-            if (consumeKeyword("NATURAL")) {
-                throw error("NATURAL JOIN is not supported");
-            }
+            boolean natural = consumeKeyword("NATURAL");
             if (peekKeyword("OUTER")) {
                 throw error("expected LEFT, RIGHT, or FULL");
             }
-            joins.add(oneJoin());
+            joins.add(oneJoin(natural));
         }
         return joins;
     }
 
-    private Join oneJoin() {
+    private Join oneJoin(boolean natural) {
         JoinKind kind;
         if (consumeKeyword("CROSS")) {
             expectKeyword("JOIN");
@@ -1352,18 +1955,27 @@ final class SqlParser {
             throw error("JOIN does not call a procedure");
         }
         String alias = readAlias();
+        if (natural) {
+            if (kind == JoinKind.CROSS) {
+                throw error("NATURAL JOIN does not accept CROSS");
+            }
+            return new Join(kind, relation, alias, null, true, List.of());
+        }
+        if (consumeKeyword("USING")) {
+            expectSymbol("(");
+            List<String> columns = new ArrayList<>();
+            do {
+                columns.add(expectIdent());
+            } while (consumeSymbol(","));
+            expectSymbol(")");
+            return new Join(kind, relation, alias, null, false, columns);
+        }
         Expr on = null;
         if (kind == JoinKind.CROSS) {
-            if (peekKeyword("USING")) {
-                throw error("USING is not supported");
-            }
             if (consumeKeyword("ON")) {
                 throw error("CROSS JOIN does not accept ON");
             }
         } else {
-            if (peekKeyword("USING")) {
-                throw error("USING is not supported");
-            }
             expectKeyword("ON");
             on = expression();
         }
@@ -1409,7 +2021,10 @@ final class SqlParser {
         if (consumeKeyword("ORDER")) {
             expectKeyword("BY");
             do {
+                boolean windows = allowWindow;
+                allowWindow = true;
                 Expr expr = expression();
+                allowWindow = windows;
                 boolean desc = consumeKeyword("DESC");
                 if (!desc) {
                     consumeKeyword("ASC");
@@ -1446,6 +2061,10 @@ final class SqlParser {
         boolean auto = false;
         boolean hasDefault = false;
         Object def = null;
+        String defaultSource = null;
+        String generated = null;
+        String checkName = null;
+        String checkSource = null;
         boolean explicitNull = false;
         while (true) {
             if (consumeKeyword("PRIMARY")) {
@@ -1464,7 +2083,38 @@ final class SqlParser {
                 auto = true;
             } else if (consumeKeyword("DEFAULT")) {
                 hasDefault = true;
-                def = parseDefault();
+                if (peekLiteralDefault()) {
+                    def = parseDefault();
+                } else {
+                    int start = current().start;
+                    expression();
+                    defaultSource = sql.substring(start, tokens.get(cursor - 1).end).trim();
+                }
+            } else if (consumeKeyword("GENERATED")) {
+                expectKeyword("ALWAYS");
+                expectKeyword("AS");
+                expectSymbol("(");
+                int start = current().start;
+                expression();
+                generated = sql.substring(start, tokens.get(cursor - 1).end).trim();
+                expectSymbol(")");
+                expectKeyword("STORED");
+            } else if (consumeKeyword("CHECK")) {
+                expectSymbol("(");
+                int start = current().start;
+                expression();
+                checkSource = sql.substring(start, tokens.get(cursor - 1).end).trim();
+                expectSymbol(")");
+            } else if (consumeKeyword("CONSTRAINT")) {
+                checkName = expectIdent();
+                expectKeyword("CHECK");
+                expectSymbol("(");
+                int start = current().start;
+                expression();
+                checkSource = sql.substring(start, tokens.get(cursor - 1).end).trim();
+                expectSymbol(")");
+            } else if (consumeKeyword("COLLATE")) {
+                type = type.withCollation(Collation.parse(expectIdent()));
             } else {
                 break;
             }
@@ -1475,8 +2125,31 @@ final class SqlParser {
         if (auto && !type.type.exactInteger()) {
             throw error("AUTOINCREMENT is only allowed on SMALLINT, INTEGER, or BIGINT");
         }
+        if (generated != null && (primary || unique || notNull && auto)) {
+            throw error("generated column cannot be a key: " + name);
+        }
+        if (type.collation != Collation.BINARY && type.type != DataType.CHAR && type.type != DataType.VARCHAR) {
+            throw error("COLLATE applies to CHAR and VARCHAR");
+        }
         validateType(name, type);
-        return new ColDef(name, type.type, type.length, type.scale, notNull, primary, unique, auto, hasDefault, def);
+        return new ColDef(name, type.type, type.length, type.scale, notNull, primary, unique, auto, hasDefault, def,
+                defaultSource, generated, checkName, checkSource, type.collation, type.domain);
+    }
+
+    private boolean peekLiteralDefault() {
+        if (peekKeyword("NULL") || peekKeyword("TRUE") || peekKeyword("FALSE")) {
+            return true;
+        }
+        if (peekSymbol("-") || peekSymbol("+")) {
+            return currentAheadKindNumber(1);
+        }
+        Token token = current();
+        return token.kind == TokenKind.NUMBER || token.kind == TokenKind.STRING || token.kind == TokenKind.HEX;
+    }
+
+    private boolean currentAheadKindNumber(int ahead) {
+        int index = cursor + ahead;
+        return index < tokens.size() && tokens.get(index).kind == TokenKind.NUMBER;
     }
 
     private Object parseDefault() {
@@ -1548,7 +2221,24 @@ final class SqlParser {
             return new TypeSpec(DataType.TIME, 0, 0);
         }
         if (consumeKeyword("TIMESTAMP")) {
+            if (consumeKeyword("WITH")) {
+                expectKeyword("TIME");
+                expectKeyword("ZONE");
+                return new TypeSpec(DataType.TIMESTAMPTZ, 0, 0);
+            }
             return new TypeSpec(DataType.TIMESTAMP, 0, 0);
+        }
+        if (consumeKeyword("UUID")) {
+            return new TypeSpec(DataType.UUID, 0, 0);
+        }
+        if (consumeKeyword("JSON")) {
+            return new TypeSpec(DataType.JSON, 0, 0);
+        }
+        if (consumeKeyword("INTERVAL")) {
+            expectKeyword("DAY");
+            expectKeyword("TO");
+            expectKeyword("SECOND");
+            return new TypeSpec(DataType.INTERVAL, 0, 0);
         }
         if (consumeKeyword("DECIMAL") || consumeKeyword("NUMERIC")) {
             expectSymbol("(");
@@ -1565,6 +2255,9 @@ final class SqlParser {
                 expectLength();
             }
             return new TypeSpec(DataType.BLOB, 0, 0);
+        }
+        if (current().kind == TokenKind.IDENT) {
+            return new TypeSpec(DataType.INTEGER, 0, 0, expectIdent(), 0);
         }
         throw error("unknown data type");
     }
@@ -1628,6 +2321,11 @@ final class SqlParser {
         }
         if (consumeKeyword("IN")) {
             expectSymbol("(");
+            if (peekKeyword("SELECT") || peekKeyword("WITH")) {
+                Query query = nestedQuery();
+                expectSymbol(")");
+                return new InSubquery(left, query, negated);
+            }
             List<Expr> values = new ArrayList<>();
             if (!peekSymbol(")")) {
                 do {
@@ -1749,13 +2447,47 @@ final class SqlParser {
         if (consumeKeyword("NULL")) {
             return new Literal(null);
         }
+        if (consumeKeyword("INTERVAL")) {
+            if (current().kind != TokenKind.STRING) {
+                throw error("INTERVAL expects a string");
+            }
+            String text = current().text;
+            cursor++;
+            expectKeyword("DAY");
+            expectKeyword("TO");
+            expectKeyword("SECOND");
+            return new Literal(SqlInterval.parse(text));
+        }
+        if (consumeKeyword("UUID")) {
+            if (current().kind != TokenKind.STRING) {
+                throw error("UUID expects a string");
+            }
+            String text = current().text;
+            cursor++;
+            return new Literal(Values.toUuid(text));
+        }
         if (consumeKeyword("TRUE")) {
             return new Literal(true);
         }
         if (consumeKeyword("FALSE")) {
             return new Literal(false);
         }
+        if (consumeKeyword("CASE")) {
+            return parseCase();
+        }
+        if (peekKeyword("EXISTS") && peekSymbol(1, "(")) {
+            consumeKeyword("EXISTS");
+            expectSymbol("(");
+            Query query = nestedQuery();
+            expectSymbol(")");
+            return new ExistsExpr(query);
+        }
         if (consumeSymbol("(")) {
+            if (peekKeyword("SELECT") || peekKeyword("WITH")) {
+                Query query = nestedQuery();
+                expectSymbol(")");
+                return new ScalarSubquery(query);
+            }
             Expr expr = expression();
             expectSymbol(")");
             return expr;
@@ -1789,7 +2521,17 @@ final class SqlParser {
             String name = token.text;
             cursor++;
             if (consumeSymbol("(")) {
-                return call(name);
+                Expr called = call(name);
+                if (peekKeyword("OVER")) {
+                    if (!allowWindow) {
+                        throw error("window function is not allowed in WHERE");
+                    }
+                    if (!(called instanceof Call function)) {
+                        throw error("OVER requires a function");
+                    }
+                    return window(function);
+                }
+                return called;
             }
             String qualifier = null;
             if (consumeSymbol(".")) {
@@ -1820,7 +2562,124 @@ final class SqlParser {
         };
     }
 
+    private Expr parseCase() {
+        Expr operand = null;
+        if (!peekKeyword("WHEN")) {
+            operand = expression();
+        }
+        List<WhenBranch> branches = new ArrayList<>();
+        if (!peekKeyword("WHEN")) {
+            throw error("expected WHEN");
+        }
+        while (consumeKeyword("WHEN")) {
+            Expr when = expression();
+            expectKeyword("THEN");
+            branches.add(new WhenBranch(when, expression()));
+        }
+        Expr otherwise = null;
+        if (consumeKeyword("ELSE")) {
+            otherwise = expression();
+        }
+        expectKeyword("END");
+        return new CaseExpr(operand, branches, otherwise);
+    }
+
+    private Psql executeStatement() {
+        Expr text = expression();
+        List<Expr> arguments = List.of();
+        if (consumeSymbol("(")) {
+            arguments = new ArrayList<>();
+            if (!peekSymbol(")")) {
+                do {
+                    arguments.add(expression());
+                } while (consumeSymbol(","));
+            }
+            expectSymbol(")");
+        }
+        List<String> targets = peekKeyword("INTO") ? intoTargets() : List.of();
+        return new PsqlExecuteStatement(text, arguments, targets);
+    }
+
+    private Expr window(Call call) {
+        expectKeyword("OVER");
+        expectSymbol("(");
+        List<Expr> partition = new ArrayList<>();
+        if (consumeKeyword("PARTITION")) {
+            expectKeyword("BY");
+            do {
+                partition.add(expression());
+            } while (consumeSymbol(","));
+        }
+        List<OrderItem> order = new ArrayList<>();
+        if (consumeKeyword("ORDER")) {
+            expectKeyword("BY");
+            do {
+                Expr expr = expression();
+                boolean desc = consumeKeyword("DESC");
+                if (!desc) {
+                    consumeKeyword("ASC");
+                }
+                order.add(new OrderItem(expr, desc));
+            } while (consumeSymbol(","));
+        }
+        boolean frame = false;
+        if (peekKeyword("RANGE") || peekKeyword("GROUPS") || peekKeyword("ROWS")) {
+            if (!consumeKeyword("ROWS")) {
+                throw error("window frame supports ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
+            }
+            expectKeyword("BETWEEN");
+            expectKeyword("UNBOUNDED");
+            expectKeyword("PRECEDING");
+            expectKeyword("AND");
+            expectKeyword("CURRENT");
+            expectKeyword("ROW");
+            frame = true;
+        }
+        expectSymbol(")");
+        return new WindowExpr(call, partition, order, frame, List.of());
+    }
+
+    private boolean containsWindow(List<OrderItem> order) {
+        for (OrderItem item : order) {
+            if (item.expr() instanceof WindowExpr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private Expr call(String name) {
+        String upper = name.toUpperCase(Locale.ROOT);
+        if (upper.equals("CAST")) {
+            Expr expr = expression();
+            expectKeyword("AS");
+            TypeSpec type = parseType();
+            expectSymbol(")");
+            return new CastExpr(expr, type.type(), type.length(), type.scale());
+        }
+        if (upper.equals("NULLIF")) {
+            Expr left = expression();
+            expectSymbol(",");
+            Expr right = expression();
+            expectSymbol(")");
+            return new CaseExpr(null, List.of(new WhenBranch(new Binary(BinaryOp.EQ, left, right), new Literal(null))), left);
+        }
+        if (upper.equals("EXTRACT")) {
+            String part = expectIdent().toUpperCase(Locale.ROOT);
+            expectKeyword("FROM");
+            Expr value = expression();
+            expectSymbol(")");
+            return new Call("EXTRACT", false, false, List.of(new Literal(part), value));
+        }
+        if (upper.equals("SUBSTRING")) {
+            return substringCall();
+        }
+        if (upper.equals("POSITION") && !peekKeyword("DISTINCT")) {
+            return positionCall();
+        }
+        if (upper.equals("DATEADD") || upper.equals("DATEDIFF")) {
+            return dateCall(upper);
+        }
         boolean distinct = consumeKeyword("DISTINCT");
         boolean star = false;
         List<Expr> args = new ArrayList<>();
@@ -1836,6 +2695,50 @@ final class SqlParser {
         }
         expectSymbol(")");
         return new Call(name, distinct, star, args);
+    }
+
+    private Expr substringCall() {
+        Expr value = expression();
+        if (consumeKeyword("FROM")) {
+            Expr start = expression();
+            expectKeyword("FOR");
+            Expr length = expression();
+            expectSymbol(")");
+            return new Call("SUBSTRING", false, false, List.of(value, start, length));
+        }
+        List<Expr> args = new ArrayList<>();
+        args.add(value);
+        while (consumeSymbol(",")) {
+            args.add(expression());
+        }
+        expectSymbol(")");
+        if (args.size() < 2 || args.size() > 3) {
+            throw error("SUBSTRING expects the text, the start, and the length");
+        }
+        return new Call("SUBSTRING", false, false, args);
+    }
+
+    private Expr positionCall() {
+        Expr needle = parseConcat();
+        if (consumeKeyword("IN")) {
+            Expr haystack = expression();
+            expectSymbol(")");
+            return new Call("POSITION", false, false, List.of(needle, haystack));
+        }
+        expectSymbol(",");
+        Expr haystack = expression();
+        expectSymbol(")");
+        return new Call("POSITION", false, false, List.of(needle, haystack));
+    }
+
+    private Expr dateCall(String name) {
+        String part = expectIdent().toUpperCase(Locale.ROOT);
+        expectSymbol(",");
+        Expr amountOrStart = expression();
+        expectSymbol(",");
+        Expr value = expression();
+        expectSymbol(")");
+        return new Call(name, false, false, List.of(new Literal(part), amountOrStart, value));
     }
 
     private List<String> columnList() {
@@ -1927,6 +2830,24 @@ final class SqlParser {
         return consumeKeyword(keyword);
     }
 
+    private int isolationLevel() {
+        if (consumeKeyword("SERIALIZABLE")) {
+            return 8;
+        }
+        if (consumeKeyword("REPEATABLE")) {
+            expectKeyword("READ");
+            return 4;
+        }
+        if (consumeKeyword("READ")) {
+            if (consumeKeyword("UNCOMMITTED")) {
+                return 1;
+            }
+            expectKeyword("COMMITTED");
+            return 2;
+        }
+        throw error("isolation level is required");
+    }
+
     private boolean consumeKeyword(String keyword) {
         if (!peekKeyword(keyword)) {
             return false;
@@ -1946,10 +2867,11 @@ final class SqlParser {
     private boolean peekClause() {
         return peekKeyword("FROM") || peekKeyword("WHERE") || peekKeyword("ORDER") || peekKeyword("GROUP")
                 || peekKeyword("HAVING") || peekKeyword("LIMIT") || peekKeyword("OFFSET") || peekKeyword("UNION")
+                || peekKeyword("EXCEPT") || peekKeyword("INTERSECT")
                 || peekKeyword("JOIN") || peekKeyword("INNER") || peekKeyword("LEFT") || peekKeyword("RIGHT")
                 || peekKeyword("FULL") || peekKeyword("CROSS") || peekKeyword("OUTER") || peekKeyword("NATURAL")
                 || peekKeyword("USING") || peekKeyword("ON")
-                || peekKeyword("SET") || peekKeyword("INTO") || peekKeyword("DO");
+                || peekKeyword("SET") || peekKeyword("INTO") || peekKeyword("DO") || peekKeyword("RETURNING");
     }
 
     private boolean peekKeyword(String keyword) {
@@ -2203,6 +3125,16 @@ final class SqlParser {
     private record Token(TokenKind kind, String text, byte[] hex, int start, int end, boolean quoted, int parameter) {
     }
 
-    private record TypeSpec(DataType type, int length, int scale) {
+    private record TypeSpec(DataType type, int length, int scale, String domain, int collation) {
+        private TypeSpec(DataType type, int length, int scale) {
+            this(type, length, scale, null, 0);
+        }
+
+        private TypeSpec withCollation(int next) {
+            return new TypeSpec(type, length, scale, domain, next);
+        }
+    }
+
+    private record Returning(boolean all, List<SelectItem> items) {
     }
 }

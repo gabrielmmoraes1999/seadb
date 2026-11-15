@@ -1,5 +1,6 @@
 package io.github.gabrielmmoraes1999.seadb.jdbc;
 
+import io.github.gabrielmmoraes1999.seadb.ParameterMeta;
 import io.github.gabrielmmoraes1999.seadb.SqlResult;
 import io.github.gabrielmmoraes1999.seadb.TableDescription;
 
@@ -21,6 +22,16 @@ interface DatabaseAccess {
     boolean ownsTransaction();
 
     SqlResult execute(String sql, Object[] params) throws SQLException;
+
+    SqlResult execute(String sql, Object[] params, int fetch) throws SQLException;
+
+    SqlResult execute(String sql, Object[] params, int fetch, int timeoutSeconds) throws SQLException;
+
+    SqlResult fetch(long cursor, int count) throws SQLException;
+
+    void cancel() throws SQLException;
+
+    List<ParameterMeta> describeParameters(String sql) throws SQLException;
 
     void setSchema(String schema) throws SQLException;
 

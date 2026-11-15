@@ -29,7 +29,11 @@ final class IndexTree {
         byte[] read(long offset, int length);
     }
 
-    record Spec(String name, int[] columns, boolean primary, boolean unique) {
+    record Spec(String name, int[] columns, boolean primary, boolean unique, String predicate, String[] expressions,
+                int[] include) {
+        Spec(String name, int[] columns, boolean primary, boolean unique) {
+            this(name, columns, primary, unique, null, null, new int[0]);
+        }
     }
 
     static List<Spec> specs(Schema schema) {
@@ -41,7 +45,8 @@ final class IndexTree {
             list.add(new Spec(unique.name, unique.columns, false, true));
         }
         for (IndexDef index : schema.indexes) {
-            list.add(new Spec(index.name, index.columns, false, index.unique));
+            list.add(new Spec(index.name, index.columns, false, index.unique, index.predicate, index.expressions,
+                    index.include));
         }
         return list;
     }
@@ -85,33 +90,72 @@ final class IndexTree {
     private IndexTree() {
     }
 
+    record CoverHit(long id, Object[] included) {
+    }
+
     static final class DiskIndex {
         final String name;
         final int[] columns;
         final boolean primary;
         final boolean unique;
+        final String predicate;
+        final String[] expressions;
+        final String[] canon;
+        final int[] include;
         final Node root;
         final long rootOffset;
 
-        private DiskIndex(String name, int[] columns, boolean primary, boolean unique, Node root, long rootOffset) {
+        private DiskIndex(String name, int[] columns, boolean primary, boolean unique, Node root, long rootOffset,
+                          String predicate, String[] expressions, int[] include) {
             this.name = name;
             this.columns = columns.clone();
             this.primary = primary;
             this.unique = unique || primary;
+            this.predicate = predicate == null || predicate.isBlank() ? null : predicate;
+            this.expressions = expressions == null ? null : expressions.clone();
+            this.include = include == null ? new int[0] : include.clone();
+            this.canon = new String[this.expressions == null ? 0 : this.expressions.length];
+            if (this.expressions != null) {
+                for (int i = 0; i < this.expressions.length; i++) {
+                    if (this.expressions[i] != null && !this.expressions[i].isBlank()) {
+                        this.canon[i] = IndexFeatures.canonical(SqlParser.parseExpression(this.expressions[i]));
+                    }
+                }
+            }
             this.root = root;
             this.rootOffset = rootOffset;
         }
 
         static DiskIndex empty(Spec spec) {
-            return new DiskIndex(spec.name, spec.columns, spec.primary, spec.unique, null, 0);
+            return new DiskIndex(spec.name, spec.columns, spec.primary, spec.unique, null, 0, spec.predicate,
+                    spec.expressions, spec.include);
         }
 
         static DiskIndex stored(Spec spec, long rootOffset) {
-            return new DiskIndex(spec.name, spec.columns, spec.primary, spec.unique, null, rootOffset);
+            return new DiskIndex(spec.name, spec.columns, spec.primary, spec.unique, null, rootOffset, spec.predicate,
+                    spec.expressions, spec.include);
         }
 
         DiskIndex withColumns(int[] mapped) {
-            return new DiskIndex(name, mapped, primary, unique, root, rootOffset);
+            return new DiskIndex(name, mapped, primary, unique, root, rootOffset, predicate, expressions, include);
+        }
+
+        private DiskIndex reborn(Node root, long rootOffset) {
+            return new DiskIndex(name, columns, primary, unique, root, rootOffset, predicate, expressions, include);
+        }
+
+        boolean expressionAt(int index) {
+            return canon != null && index < canon.length && canon[index] != null;
+        }
+
+        boolean eligible(Expr where, Schema schema) {
+            if (predicate == null) {
+                return true;
+            }
+            if (where == null) {
+                return false;
+            }
+            return IndexFeatures.implies(SqlParser.parseExpression(predicate), where, schema);
         }
 
         boolean covers(Map<Integer, Object> equals) {
@@ -123,9 +167,17 @@ final class IndexTree {
          * A lookup can use the matching leading columns as an index prefix.
          */
         int prefixLength(Map<Integer, Object> equals) {
+            return prefixLength(equals, Map.of());
+        }
+
+        int prefixLength(Map<Integer, Object> equals, Map<String, Object> calls) {
             int count = 0;
-            for (int column : columns) {
-                if (!equals.containsKey(column)) {
+            for (int i = 0; i < columns.length; i++) {
+                if (expressionAt(i)) {
+                    if (calls == null || !calls.containsKey(canon[i])) {
+                        break;
+                    }
+                } else if (!equals.containsKey(columns[i])) {
                     break;
                 }
                 count++;
@@ -169,12 +221,120 @@ final class IndexTree {
             List<Long> found = new ArrayList<>();
             int at = node.lowerBound(schema, columns, prefix, values);
             while (node != null) {
+                Pace.check();
                 while (at < node.keys.length) {
                     int cmp = IndexKeys.prefixCompare(schema, columns, node.keys[at], prefix, values);
                     if (cmp > 0) {
                         return found;
                     }
                     if (cmp == 0 && node.ids[at] != null) {
+                        for (long id : node.ids[at]) {
+                            found.add(id);
+                        }
+                    }
+                    at++;
+                }
+                node = nextLeaf(path, pages);
+                at = 0;
+            }
+            return found;
+        }
+
+        /**
+         * Leaf keys from {@code low} to {@code high}. A null bound is open.
+         * {@code width} is the number of leading columns compared.
+         */
+        List<Long> findRange(Schema schema, int width, Object[] low, boolean lowInclusive, Object[] high,
+                             boolean highInclusive, PageSource pages) {
+            Node node = live(pages);
+            if (node == null || width <= 0) {
+                return List.of();
+            }
+            List<Step> path = new ArrayList<>();
+            if (low == null) {
+                while (!node.leaf) {
+                    path.add(new Step(node, 0));
+                    node = load(node, 0, pages);
+                }
+            } else {
+                while (!node.leaf) {
+                    int child = node.lowerChild(schema, columns, width, low);
+                    path.add(new Step(node, child));
+                    node = load(node, child, pages);
+                }
+            }
+            int at = low == null ? 0 : node.lowerBound(schema, columns, width, low);
+            List<Long> found = new ArrayList<>();
+            boolean skipLow = low != null && !lowInclusive;
+            while (node != null) {
+                Pace.check();
+                while (at < node.keys.length) {
+                    if (skipLow && IndexKeys.prefixCompare(schema, columns, node.keys[at], width, low) == 0) {
+                        at++;
+                        continue;
+                    }
+                    skipLow = false;
+                    if (high != null) {
+                        int cmp = IndexKeys.prefixCompare(schema, columns, node.keys[at], width, high);
+                        if (cmp > 0 || (cmp == 0 && !highInclusive)) {
+                            return found;
+                        }
+                    }
+                    if (node.ids[at] != null) {
+                        for (long id : node.ids[at]) {
+                            found.add(id);
+                        }
+                    }
+                    at++;
+                }
+                node = nextLeaf(path, pages);
+                at = 0;
+            }
+            return found;
+        }
+
+        /** Keys whose leading columns equal {@code leading} and whose next column starts with {@code prefix}. */
+        List<Long> findLikePrefix(Schema schema, Object[] leading, String prefix, PageSource pages) {
+            Object[] low = new Object[leading.length + 1];
+            System.arraycopy(leading, 0, low, 0, leading.length);
+            low[leading.length] = prefix;
+            int width = low.length;
+            Node node = live(pages);
+            if (node == null) {
+                return List.of();
+            }
+            List<Step> path = new ArrayList<>();
+            while (!node.leaf) {
+                int child = node.lowerChild(schema, columns, width, low);
+                path.add(new Step(node, child));
+                node = load(node, child, pages);
+            }
+            int at = node.lowerBound(schema, columns, width, low);
+            List<Long> found = new ArrayList<>();
+            while (node != null) {
+                while (at < node.keys.length) {
+                    if (leading.length > 0) {
+                        int lead = IndexKeys.prefixCompare(schema, columns, node.keys[at], leading.length, leading);
+                        if (lead > 0) {
+                            return found;
+                        }
+                        if (lead < 0) {
+                            at++;
+                            continue;
+                        }
+                    }
+                    Object stored = IndexKeys.readPrefix(schema, columns, node.keys[at], width)[leading.length];
+                    if (!(stored instanceof String text) || !text.startsWith(prefix)) {
+                        if (stored instanceof String text && text.compareTo(prefix) > 0) {
+                            return found;
+                        }
+                        if (!(stored instanceof String)) {
+                            return found;
+                        }
+                        at++;
+                        continue;
+                    }
+                    if (node.ids[at] != null) {
                         for (long id : node.ids[at]) {
                             found.add(id);
                         }
@@ -218,13 +378,17 @@ final class IndexTree {
         }
 
         DiskIndex insert(Schema schema, Object[] values, long rowId, List<Extent> freed, PageSource pages) {
+            return insert(schema, values, rowId, null, freed, pages);
+        }
+
+        DiskIndex insert(Schema schema, Object[] values, long rowId, byte[] covered, List<Extent> freed, PageSource pages) {
             byte[] key = IndexKeys.encode(schema, columns, values);
-            Split split = insertRec(live(pages), key, values, rowId, schema, freed, pages);
+            Split split = insertRec(live(pages), key, values, rowId, covered, schema, freed, pages);
             if (split.left == null) {
                 return this;
             }
             Node next = split.right == null ? split.left : branch(split.separator, split.left, split.right);
-            return new DiskIndex(name, columns, primary, unique, next, 0);
+            return reborn(next, 0);
         }
 
         DiskIndex delete(Schema schema, Object[] values, long rowId, List<Extent> freed, PageSource pages) {
@@ -238,7 +402,64 @@ final class IndexTree {
             if (next != null && next.leaf && next.keys.length == 0) {
                 next = null;
             }
-            return new DiskIndex(name, columns, primary, unique, next, 0);
+            return reborn(next, 0);
+        }
+
+        /** Row id and the INCLUDE values stored beside it. */
+        java.util.List<CoverHit> findCovered(Schema schema, Object[] values, PageSource pages) {
+            byte[] key = IndexKeys.encode(schema, columns, values);
+            Node leaf = descend(live(pages), key, schema, pages);
+            if (leaf == null) {
+                return java.util.List.of();
+            }
+            int at = leaf.exact(schema, columns, key);
+            if (at < 0) {
+                return java.util.List.of();
+            }
+            return hits(schema, leaf, at);
+        }
+
+        java.util.List<CoverHit> findCoveredPrefix(Schema schema, int prefix, Object[] values, PageSource pages) {
+            Node node = live(pages);
+            if (node == null || prefix <= 0) {
+                return java.util.List.of();
+            }
+            java.util.List<Step> path = new java.util.ArrayList<>();
+            while (!node.leaf) {
+                int child = node.lowerChild(schema, columns, prefix, values);
+                path.add(new Step(node, child));
+                node = load(node, child, pages);
+            }
+            java.util.List<CoverHit> found = new java.util.ArrayList<>();
+            int at = node.lowerBound(schema, columns, prefix, values);
+            while (node != null) {
+                while (at < node.keys.length) {
+                    int cmp = IndexKeys.prefixCompare(schema, columns, node.keys[at], prefix, values);
+                    if (cmp > 0) {
+                        return found;
+                    }
+                    if (cmp == 0) {
+                        found.addAll(hits(schema, node, at));
+                    }
+                    at++;
+                }
+                node = nextLeaf(path, pages);
+                at = 0;
+            }
+            return found;
+        }
+
+        private java.util.List<CoverHit> hits(Schema schema, Node leaf, int at) {
+            long[] ids = leaf.ids[at];
+            java.util.List<CoverHit> found = new java.util.ArrayList<>(ids.length);
+            for (int i = 0; i < ids.length; i++) {
+                Object[] included = null;
+                if (leaf.covers != null && leaf.covers[at] != null && i < leaf.covers[at].length) {
+                    included = Cover.decode(schema, include, leaf.covers[at][i]);
+                }
+                found.add(new CoverHit(ids[i], included));
+            }
+            return found;
         }
 
         DiskIndex fill(Schema schema, Iterable<StoredRow> rows, KeyReader reader, List<Extent> freed, PageSource pages) {
@@ -248,7 +469,7 @@ final class IndexTree {
                 if (values == null) {
                     continue;
                 }
-                current = current.insert(schema, values, row.id, freed, pages);
+                current = current.insert(schema, values, row.id, reader.covered(schema, current, row), freed, pages);
             }
             return current;
         }
@@ -378,10 +599,10 @@ final class IndexTree {
             }
         }
 
-        private Split insertRec(Node node, byte[] key, Object[] values, long rowId, Schema schema,
+        private Split insertRec(Node node, byte[] key, Object[] values, long rowId, byte[] covered, Schema schema,
                                 List<Extent> freed, PageSource pages) {
             if (node == null) {
-                return new Split(Node.leaf(key, new long[]{rowId}), null, null);
+                return new Split(Node.leaf(key, new long[]{rowId}, covered), null, null);
             }
             if (node.leaf) {
                 int at = node.exact(schema, columns, key);
@@ -392,14 +613,14 @@ final class IndexTree {
                     throw duplicate(schema, values);
                 }
                 Node current = cow(node, freed);
-                current.put(schema, columns, key, rowId);
+                current.put(schema, columns, key, rowId, covered);
                 if (Pages.fits(current)) {
                     return new Split(current, null, null);
                 }
                 return current.splitLeaf();
             }
             int at = node.childIndex(schema, columns, key);
-            Split below = insertRec(load(node, at, pages), key, values, rowId, schema, freed, pages);
+            Split below = insertRec(load(node, at, pages), key, values, rowId, covered, schema, freed, pages);
             if (below.left == null) {
                 return below;
             }
@@ -530,6 +751,10 @@ final class IndexTree {
 
     interface KeyReader {
         Object[] parts(Schema schema, DiskIndex index, StoredRow row);
+
+        default byte[] covered(Schema schema, DiskIndex index, StoredRow row) {
+            return null;
+        }
     }
 
     private record Split(Node left, byte[] separator, Node right) {
@@ -541,6 +766,8 @@ final class IndexTree {
         long diskOffset;
         byte[][] keys = new byte[0][];
         long[][] ids = new long[0][];
+        /** Included column payloads, one per row id of each key. Null when the index has no INCLUDE. */
+        byte[][][] covers;
         long[] childOffsets = new long[0];
         Node[] children;
         long[] keyOverflowOffset = new long[0];
@@ -548,12 +775,15 @@ final class IndexTree {
         long[] idsOverflowOffset = new long[0];
         int[] idsOverflowLength = new int[0];
 
-        static Node leaf(byte[] key, long[] rowIds) {
+        static Node leaf(byte[] key, long[] rowIds, byte[] covered) {
             Node node = new Node();
             node.leaf = true;
             node.dirty = true;
             node.keys = new byte[][]{key};
             node.ids = new long[][]{rowIds};
+            if (covered != null) {
+                node.covers = new byte[][][]{new byte[][]{covered}};
+            }
             return node;
         }
 
@@ -563,6 +793,7 @@ final class IndexTree {
             copy.dirty = true;
             copy.keys = keys.clone();
             copy.ids = ids.clone();
+            copy.covers = covers == null ? null : covers.clone();
             copy.childOffsets = childOffsets.clone();
             copy.children = children == null ? null : children.clone();
             return copy;
@@ -630,7 +861,7 @@ final class IndexTree {
             return lo;
         }
 
-        void put(Schema schema, int[] columns, byte[] key, long rowId) {
+        void put(Schema schema, int[] columns, byte[] key, long rowId, byte[] covered) {
             boolean overflow = keyOverflowOffset.length != 0 || idsOverflowOffset.length != 0;
             if (overflow) {
                 alignOverflow();
@@ -638,6 +869,10 @@ final class IndexTree {
             int at = exact(schema, columns, key);
             if (at >= 0) {
                 ids[at] = append(ids[at], rowId);
+                if (covered != null) {
+                    ensureCovers();
+                    covers[at] = appendCover(covers[at], covered);
+                }
                 return;
             }
             int lo = 0;
@@ -650,8 +885,14 @@ final class IndexTree {
                     hi = mid;
                 }
             }
+            if (covered != null) {
+                ensureCovers();
+            }
             keys = insertKey(keys, lo, key);
             ids = insertIds(ids, lo, new long[]{rowId});
+            if (covered != null) {
+                covers = insertCovers(covers, lo, new byte[][]{covered});
+            }
             if (overflow) {
                 keyOverflowOffset = insertLong(keyOverflowOffset, lo, 0);
                 keyOverflowLength = insertInt(keyOverflowLength, lo, 0);
@@ -660,25 +901,39 @@ final class IndexTree {
             }
         }
 
+        private void ensureCovers() {
+            if (covers != null) {
+                return;
+            }
+            covers = new byte[keys.length][][];
+        }
+
         boolean remove(Schema schema, int[] columns, byte[] key, long rowId) {
             alignOverflow();
             int at = exact(schema, columns, key);
             if (at < 0) {
                 return false;
             }
-            long[] kept = without(ids[at], rowId);
-            if (kept == null) {
+            int idAt = indexOf(ids[at], rowId);
+            if (idAt < 0) {
                 return false;
             }
+            long[] kept = without(ids[at], rowId);
             if (kept.length == 0) {
                 keys = removeKey(keys, at);
                 ids = removeIds(ids, at);
+                if (covers != null) {
+                    covers = removeCovers(covers, at);
+                }
                 keyOverflowOffset = removeLong(keyOverflowOffset, at);
                 keyOverflowLength = removeInt(keyOverflowLength, at);
                 idsOverflowOffset = removeLong(idsOverflowOffset, at);
                 idsOverflowLength = removeInt(idsOverflowLength, at);
             } else {
                 ids[at] = kept;
+                if (covers != null && covers[at] != null) {
+                    covers[at] = withoutCover(covers[at], idAt);
+                }
             }
             return true;
         }
@@ -735,6 +990,10 @@ final class IndexTree {
             right.dirty = true;
             right.keys = Arrays.copyOfRange(keys, mid, keys.length);
             right.ids = Arrays.copyOfRange(ids, mid, ids.length);
+            if (covers != null) {
+                right.covers = Arrays.copyOfRange(covers, mid, covers.length);
+                covers = Arrays.copyOf(covers, mid);
+            }
             keys = Arrays.copyOf(keys, mid);
             ids = Arrays.copyOf(ids, mid);
             clearOverflow();
@@ -789,6 +1048,9 @@ final class IndexTree {
             if (node.leaf) {
                 for (int i = 0; i < node.keys.length; i++) {
                     size += entrySize(node.keys[i], node.ids[i]);
+                    if (node.covers != null && i < node.covers.length && node.covers[i] != null) {
+                        size += 2 + Cover.pack(node.covers[i]).length;
+                    }
                 }
                 return size;
             }
@@ -817,9 +1079,13 @@ final class IndexTree {
             Node node = new Node();
             node.diskOffset = offset;
             node.leaf = (flags & 1) != 0;
+            boolean covered = (flags & 2) != 0;
             node.keys = new byte[count][];
             if (node.leaf) {
                 node.ids = new long[count][];
+                if (covered) {
+                    node.covers = new byte[count][][];
+                }
                 node.keyOverflowOffset = new long[count];
                 node.keyOverflowLength = new int[count];
                 node.idsOverflowOffset = new long[count];
@@ -827,6 +1093,12 @@ final class IndexTree {
                 for (int i = 0; i < count; i++) {
                     node.keys[i] = readKey(buffer, source, node, i);
                     node.ids[i] = readIds(buffer, source, node, i);
+                    if (covered) {
+                        int length = buffer.getShort() & 0xFFFF;
+                        byte[] packed = new byte[length];
+                        buffer.get(packed);
+                        node.covers[i] = Cover.unpack(packed);
+                    }
                 }
             } else {
                 node.keyOverflowOffset = new long[count];
@@ -847,12 +1119,21 @@ final class IndexTree {
             byte[] page = new byte[Format.INDEX_PAGE];
             ByteBuffer buffer = ByteBuffer.wrap(page).order(Format.ORDER);
             buffer.putInt(Format.INDEX_MAGIC);
-            buffer.putShort((short) (node.leaf ? 1 : 0));
+            int flags = node.leaf ? 1 : 0;
+            if (node.leaf && node.covers != null) {
+                flags |= 2;
+            }
+            buffer.putShort((short) flags);
             buffer.putShort((short) node.keys.length);
             if (node.leaf) {
                 for (int i = 0; i < node.keys.length; i++) {
                     writeKey(buffer, node.keys[i], space, writes);
                     writeIds(buffer, node.ids[i], space, writes);
+                    if (node.covers != null) {
+                        byte[] packed = Cover.pack(node.covers[i]);
+                        buffer.putShort((short) packed.length);
+                        buffer.put(packed);
+                    }
                 }
             } else {
                 for (byte[] key : node.keys) {
@@ -977,6 +1258,75 @@ final class IndexTree {
         }
     }
 
+    static final class Cover {
+        private Cover() {
+        }
+
+        static byte[] encode(Schema schema, int[] include, Object[] values) {
+            try {
+                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputStream(raw);
+                for (int i = 0; i < include.length; i++) {
+                    Object value = values[i];
+                    if (value == null) {
+                        out.writeByte(0);
+                        continue;
+                    }
+                    out.writeByte(1);
+                    IndexKeys.write(out, schema.columns.get(include[i]), value);
+                }
+                out.flush();
+                return raw.toByteArray();
+            } catch (IOException exception) {
+                throw new SeaException("corrupt index in table " + schema.name);
+            }
+        }
+
+        static Object[] decode(Schema schema, int[] include, byte[] payload) {
+            ByteBuffer buffer = ByteBuffer.wrap(payload).order(Format.ORDER);
+            Object[] values = new Object[include.length];
+            for (int i = 0; i < include.length; i++) {
+                if (buffer.get() == 0) {
+                    values[i] = null;
+                    continue;
+                }
+                values[i] = IndexKeys.read(buffer, schema.columns.get(include[i]));
+            }
+            return values;
+        }
+
+        static byte[] pack(byte[][] payloads) {
+            try {
+                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputStream(raw);
+                int count = payloads == null ? 0 : payloads.length;
+                out.writeShort(count);
+                for (int i = 0; i < count; i++) {
+                    byte[] payload = payloads[i] == null ? new byte[0] : payloads[i];
+                    out.writeShort(payload.length);
+                    out.write(payload);
+                }
+                out.flush();
+                return raw.toByteArray();
+            } catch (IOException exception) {
+                throw new SeaException("corrupt index");
+            }
+        }
+
+        static byte[][] unpack(byte[] packed) {
+            ByteBuffer buffer = ByteBuffer.wrap(packed).order(Format.ORDER);
+            int count = buffer.getShort() & 0xFFFF;
+            byte[][] payloads = new byte[count][];
+            for (int i = 0; i < count; i++) {
+                int length = buffer.getShort() & 0xFFFF;
+                byte[] payload = new byte[length];
+                buffer.get(payload);
+                payloads[i] = payload;
+            }
+            return payloads;
+        }
+    }
+
     private static final class IndexKeys {
         private IndexKeys() {
         }
@@ -1033,11 +1383,25 @@ final class IndexTree {
                     raw[at + 2] = (byte) (number >> 8);
                     raw[at + 3] = (byte) number;
                 }
-                case BIGINT, TIME -> {
+                case BIGINT, TIME, INTERVAL -> {
                     long number = column.type == DataType.TIME
                             ? ((LocalTime) value).toNanoOfDay()
+                            : column.type == DataType.INTERVAL
+                            ? ((SqlInterval) value).millis
                             : ((Number) value).longValue();
                     writeLong(raw, at, number);
+                }
+                case UUID -> {
+                    java.util.UUID id = (java.util.UUID) value;
+                    writeLong(raw, at, id.getMostSignificantBits());
+                    writeLong(raw, at + 8, id.getLeastSignificantBits());
+                }
+                case TIMESTAMPTZ -> {
+                    java.time.OffsetDateTime stamp = (java.time.OffsetDateTime) value;
+                    writeLong(raw, at, stamp.toInstant().toEpochMilli());
+                    int minutes = stamp.getOffset().getTotalSeconds() / 60;
+                    raw[at + 8] = (byte) (minutes >> 8);
+                    raw[at + 9] = (byte) minutes;
                 }
                 case TIMESTAMP -> {
                     LocalDateTime timestamp = (LocalDateTime) value;
@@ -1083,11 +1447,21 @@ final class IndexTree {
             return 0;
         }
 
+        static Object[] readPrefix(Schema schema, int[] columns, byte[] encoded, int prefix) {
+            ByteBuffer buffer = ByteBuffer.wrap(encoded).order(Format.ORDER);
+            Object[] values = new Object[prefix];
+            for (int i = 0; i < prefix; i++) {
+                values[i] = read(buffer, schema.columns.get(columns[i]));
+            }
+            return values;
+        }
+
         static int prefixCompare(Schema schema, int[] columns, byte[] encoded, int prefix, Object[] values) {
             ByteBuffer buffer = ByteBuffer.wrap(encoded).order(Format.ORDER);
             for (int i = 0; i < prefix; i++) {
-                Object stored = read(buffer, schema.columns.get(columns[i]));
-                int cmp = Values.compare(stored, values[i]);
+                Column column = schema.columns.get(columns[i]);
+                Object stored = read(buffer, column);
+                int cmp = Collation.compare(stored, values[i], column.collation);
                 if (cmp != 0) {
                     return cmp;
                 }
@@ -1099,7 +1473,7 @@ final class IndexTree {
             Object[] a = decode(schema, columns, left);
             Object[] b = decode(schema, columns, right);
             for (int i = 0; i < columns.length; i++) {
-                int cmp = Values.compare(a[i], b[i]);
+                int cmp = Collation.compare(a[i], b[i], schema.columns.get(columns[i]).collation);
                 if (cmp != 0) {
                     return cmp;
                 }
@@ -1121,8 +1495,10 @@ final class IndexTree {
                 case BOOLEAN -> 1;
                 case SMALLINT -> 2;
                 case INTEGER, DATE -> 4;
-                case BIGINT, TIME -> 8;
+                case BIGINT, TIME, INTERVAL -> 8;
                 case TIMESTAMP -> 12;
+                case UUID -> 16;
+                case TIMESTAMPTZ -> 10;
                 default -> 0;
             };
         }
@@ -1132,7 +1508,12 @@ final class IndexTree {
                 case BOOLEAN -> Boolean.compare(left[a] != 0, right[b] != 0);
                 case SMALLINT -> Short.compare(readShort(left, a), readShort(right, b));
                 case INTEGER, DATE -> Integer.compare(readInt(left, a), readInt(right, b));
-                case BIGINT, TIME -> Long.compare(readLong(left, a), readLong(right, b));
+                case BIGINT, TIME, INTERVAL -> Long.compare(readLong(left, a), readLong(right, b));
+                case UUID -> {
+                    int cmp = Long.compareUnsigned(readLong(left, a), readLong(right, b));
+                    yield cmp != 0 ? cmp : Long.compareUnsigned(readLong(left, a + 8), readLong(right, b + 8));
+                }
+                case TIMESTAMPTZ -> Long.compare(readLong(left, a), readLong(right, b));
                 case TIMESTAMP -> {
                     int cmp = Long.compare(readLong(left, a), readLong(right, b));
                     yield cmp != 0 ? cmp : Integer.compare(readInt(left, a + 8), readInt(right, b + 8));
@@ -1176,10 +1557,21 @@ final class IndexTree {
                 case FLOAT -> out.writeFloat(((Number) value).floatValue());
                 case DOUBLE -> out.writeDouble(((Number) value).doubleValue());
                 case BOOLEAN -> out.writeBoolean((Boolean) value);
-                case CHAR, VARCHAR -> {
+                case CHAR, VARCHAR, JSON -> {
                     byte[] text = ((String) value).getBytes(StandardCharsets.UTF_8);
                     out.writeShort(text.length);
                     out.write(text);
+                }
+                case UUID -> {
+                    java.util.UUID id = (java.util.UUID) value;
+                    out.writeLong(id.getMostSignificantBits());
+                    out.writeLong(id.getLeastSignificantBits());
+                }
+                case INTERVAL -> out.writeLong(((SqlInterval) value).millis);
+                case TIMESTAMPTZ -> {
+                    java.time.OffsetDateTime stamp = (java.time.OffsetDateTime) value;
+                    out.writeLong(stamp.toInstant().toEpochMilli());
+                    out.writeShort(stamp.getOffset().getTotalSeconds() / 60);
                 }
                 case DATE -> out.writeInt((int) ((LocalDate) value).toEpochDay());
                 case TIME -> out.writeLong(((LocalTime) value).toNanoOfDay());
@@ -1207,11 +1599,19 @@ final class IndexTree {
                 case FLOAT -> buffer.getFloat();
                 case DOUBLE -> buffer.getDouble();
                 case BOOLEAN -> buffer.get() != 0;
-                case CHAR, VARCHAR -> {
+                case CHAR, VARCHAR, JSON -> {
                     int length = buffer.getShort() & 0xFFFF;
                     byte[] text = new byte[length];
                     buffer.get(text);
                     yield new String(text, StandardCharsets.UTF_8);
+                }
+                case UUID -> new java.util.UUID(buffer.getLong(), buffer.getLong());
+                case INTERVAL -> new SqlInterval(buffer.getLong());
+                case TIMESTAMPTZ -> {
+                    long epoch = buffer.getLong();
+                    short minutes = buffer.getShort();
+                    yield java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochMilli(epoch),
+                            java.time.ZoneOffset.ofTotalSeconds(minutes * 60));
                 }
                 case DATE -> LocalDate.ofEpochDay(buffer.getInt());
                 case TIME -> LocalTime.ofNanoOfDay(buffer.getLong());
@@ -1239,6 +1639,43 @@ final class IndexTree {
             }
         }
         return false;
+    }
+
+    private static int indexOf(long[] ids, long rowId) {
+        for (int i = 0; i < ids.length; i++) {
+            if (ids[i] == rowId) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static byte[][] appendCover(byte[][] covers, byte[] covered) {
+        byte[][] next = covers == null ? new byte[1][] : Arrays.copyOf(covers, covers.length + 1);
+        next[next.length - 1] = covered;
+        return next;
+    }
+
+    private static byte[][][] insertCovers(byte[][][] covers, int at, byte[][] row) {
+        byte[][][] next = new byte[covers.length + 1][][];
+        System.arraycopy(covers, 0, next, 0, at);
+        next[at] = row;
+        System.arraycopy(covers, at, next, at + 1, covers.length - at);
+        return next;
+    }
+
+    private static byte[][][] removeCovers(byte[][][] covers, int at) {
+        byte[][][] next = new byte[covers.length - 1][][];
+        System.arraycopy(covers, 0, next, 0, at);
+        System.arraycopy(covers, at + 1, next, at, covers.length - at - 1);
+        return next;
+    }
+
+    private static byte[][] withoutCover(byte[][] covers, int at) {
+        byte[][] next = new byte[covers.length - 1][];
+        System.arraycopy(covers, 0, next, 0, at);
+        System.arraycopy(covers, at + 1, next, at, covers.length - at - 1);
+        return next;
     }
 
     private static long[] append(long[] ids, long rowId) {
