@@ -60,17 +60,12 @@ final class MetaCodec {
 
     static byte[] encode(Schema schema, long nextRowId, long fileSize, List<LiveSlot> rows, List<Extent> free, long[] indexRoots,
                          int minLength, int version) {
-        if (schema.needsIndexExtensions()) {
-            version = Format.META_VERSION;
-        } else if (version == Format.MIN_VERSION && schema.needsV2()) {
-            version = Format.VERSION;
-        }
         ByteWriter writer = new ByteWriter();
         writer.u32(Format.META_MAGIC);
         writer.u32(version);
         writer.u64(nextRowId);
         writer.u64(fileSize);
-        writeSchema(writer, schema, version);
+        writeSchema(writer, schema);
         long[] roots = indexRoots == null ? new long[0] : indexRoots;
         writer.u16(roots.length);
         for (long root : roots) {
@@ -125,7 +120,7 @@ final class MetaCodec {
         }
         long nextRowId = reader.u64();
         long fileSize = reader.u64();
-        Schema schema = readSchema(reader, version);
+        Schema schema = readSchema(reader);
         int rootCount = reader.u16();
         if (rootCount < 0 || rootCount > Format.MAX_COLUMNS) {
             throw new SeaException("table metadata is corrupt");
@@ -162,7 +157,7 @@ final class MetaCodec {
         return (8 - (unpadded % 8)) % 8;
     }
 
-    private static void writeSchema(ByteWriter writer, Schema schema, int version) {
+    private static void writeSchema(ByteWriter writer, Schema schema) {
         writer.utf(schema.name);
         writer.u16(schema.columns.size());
         for (Column column : schema.columns) {
@@ -174,12 +169,10 @@ final class MetaCodec {
             writer.u8(flags);
             writer.u64(column.nextIdentity);
             writeDefault(writer, column);
-            if (version >= Format.VERSION) {
-                writer.u8(column.collation);
-                writer.utf(column.domain == null ? "" : column.domain);
-                writer.utf(column.generated == null ? "" : column.generated);
-                writer.utf(column.defaultExpr == null ? "" : column.defaultExpr);
-            }
+            writer.u8(column.collation);
+            writer.utf(column.domain == null ? "" : column.domain);
+            writer.utf(column.generated == null ? "" : column.generated);
+            writer.utf(column.defaultExpr == null ? "" : column.defaultExpr);
         }
         writer.u16(schema.primaryKey.length);
         for (int index : schema.primaryKey) {
@@ -202,17 +195,15 @@ final class MetaCodec {
                 writer.u16(column);
             }
             writer.u8(index.descending ? 1 : 0);
-            if (version >= Format.META_VERSION) {
-                writer.utf(index.predicate == null ? "" : index.predicate);
-                String[] expressions = index.expressions == null ? new String[0] : index.expressions;
-                writer.u16(expressions.length);
-                for (String expression : expressions) {
-                    writer.utf(expression == null ? "" : expression);
-                }
-                writer.u16(index.include.length);
-                for (int column : index.include) {
-                    writer.u16(column);
-                }
+            writer.utf(index.predicate == null ? "" : index.predicate);
+            String[] expressions = index.expressions == null ? new String[0] : index.expressions;
+            writer.u16(expressions.length);
+            for (String expression : expressions) {
+                writer.utf(expression == null ? "" : expression);
+            }
+            writer.u16(index.include.length);
+            for (int column : index.include) {
+                writer.u16(column);
             }
         }
         writer.utf(schema.primaryConstraint == null ? "" : schema.primaryConstraint);
@@ -236,17 +227,15 @@ final class MetaCodec {
             writer.u8(key.onUpdate.ordinal());
             writer.u8(key.onDelete.ordinal());
         }
-        if (version >= Format.VERSION) {
-            writer.u16(schema.checks.size());
-            for (CheckConstraint check : schema.checks) {
-                writer.utf(check.name);
-                writer.utf(check.column == null ? "" : check.column);
-                writer.utf(check.expression);
-            }
+        writer.u16(schema.checks.size());
+        for (CheckConstraint check : schema.checks) {
+            writer.utf(check.name);
+            writer.utf(check.column == null ? "" : check.column);
+            writer.utf(check.expression);
         }
     }
 
-    private static Schema readSchema(ByteReader reader, int version) {
+    private static Schema readSchema(ByteReader reader) {
         String name = SystemTables.currentName(reader.utf());
         int count = reader.u16();
         if (count <= 0 || count > Format.MAX_COLUMNS) {
@@ -268,16 +257,10 @@ final class MetaCodec {
             int flags = reader.u8();
             long nextIdentity = reader.u64();
             DefaultValue def = readDefault(reader, type);
-            int collation = 0;
-            String domain = null;
-            String generated = null;
-            String defaultExpr = null;
-            if (version >= Format.VERSION) {
-                collation = reader.u8();
-                domain = reader.utf();
-                generated = reader.utf();
-                defaultExpr = reader.utf();
-            }
+            int collation = reader.u8();
+            String domain = reader.utf();
+            String generated = reader.utf();
+            String defaultExpr = reader.utf();
             columns.add(new Column(columnName, type, length, scale,
                     (flags & FLAG_NOT_NULL) != 0,
                     (flags & FLAG_AUTO) != 0,
@@ -326,27 +309,22 @@ final class MetaCodec {
                 group[j] = column;
             }
             boolean descending = reader.u8() != 0;
-            String predicate = null;
-            String[] expressions = null;
-            int[] include = new int[0];
-            if (version >= Format.META_VERSION) {
-                String written = reader.utf();
-                predicate = written.isEmpty() ? null : written;
-                int expressionCount = reader.u16();
-                expressions = new String[expressionCount];
-                for (int j = 0; j < expressionCount; j++) {
-                    String expression = reader.utf();
-                    expressions[j] = expression.isEmpty() ? null : expression;
+            String written = reader.utf();
+            String predicate = written.isEmpty() ? null : written;
+            int expressionCount = reader.u16();
+            String[] expressions = new String[expressionCount];
+            for (int j = 0; j < expressionCount; j++) {
+                String expression = reader.utf();
+                expressions[j] = expression.isEmpty() ? null : expression;
+            }
+            int includeCount = reader.u16();
+            int[] include = new int[includeCount];
+            for (int j = 0; j < includeCount; j++) {
+                int column = reader.u16();
+                if (column < 0 || column >= columns.size()) {
+                    throw new SeaException("table schema is corrupt");
                 }
-                int includeCount = reader.u16();
-                include = new int[includeCount];
-                for (int j = 0; j < includeCount; j++) {
-                    int column = reader.u16();
-                    if (column < 0 || column >= columns.size()) {
-                        throw new SeaException("table schema is corrupt");
-                    }
-                    include[j] = column;
-                }
+                include[j] = column;
             }
             indexes.add(new IndexDef(indexName, group, unique, descending, predicate, expressions, include));
         }
@@ -390,11 +368,9 @@ final class MetaCodec {
                     referenced, indexName, descending, onUpdate, onDelete));
         }
         List<CheckConstraint> checks = new ArrayList<>();
-        if (version >= Format.VERSION) {
-            int checkCount = reader.u16();
-            for (int i = 0; i < checkCount; i++) {
-                checks.add(new CheckConstraint(reader.utf(), reader.utf(), reader.utf()));
-            }
+        int checkCount = reader.u16();
+        for (int i = 0; i < checkCount; i++) {
+            checks.add(new CheckConstraint(reader.utf(), reader.utf(), reader.utf()));
         }
         return new Schema(name, columns, primary, uniques, indexes,
                 primaryConstraint, primaryIndex, primaryDescending, foreignKeys, checks);

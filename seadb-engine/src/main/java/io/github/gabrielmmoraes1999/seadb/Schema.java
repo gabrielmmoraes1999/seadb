@@ -88,11 +88,6 @@ final class Column {
     boolean character() {
         return type == DataType.CHAR || type == DataType.VARCHAR || type == DataType.JSON;
     }
-
-    boolean needsV2() {
-        return collation != Collation.BINARY || domain != null || generated != null || defaultExpr != null
-                || type.ordinal() > DataType.BIGINT.ordinal();
-    }
 }
 
 final class IndexDef {
@@ -127,21 +122,6 @@ final class IndexDef {
 
     IndexDef copy() {
         return new IndexDef(name, columns, unique, descending, predicate, expressions, include);
-    }
-
-    boolean extended() {
-        if (predicate != null || include.length > 0) {
-            return true;
-        }
-        if (expressions == null) {
-            return false;
-        }
-        for (String expression : expressions) {
-            if (expression != null && !expression.isBlank()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     String expressionAt(int index) {
@@ -258,27 +238,6 @@ final class Schema {
                         key.referencedColumns, key.indexName, key.descending, key.onUpdate, key.onDelete))
                 .toList();
         this.checks = checks == null ? List.of() : List.copyOf(checks);
-    }
-
-    boolean needsV2() {
-        if (!checks.isEmpty()) {
-            return true;
-        }
-        for (Column column : columns) {
-            if (column.needsV2()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    boolean needsIndexExtensions() {
-        for (IndexDef index : indexes) {
-            if (index.extended()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     Schema withForeignKeys(List<ForeignKey> next) {

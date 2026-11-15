@@ -222,15 +222,18 @@ class SqlExtensionTest {
         }
         byte[] header = Files.readAllBytes(file);
         int version = ByteBuffer.wrap(header).order(Format.ORDER).getShort(Format.VERSION_OFFSET) & 0xFFFF;
-        assertEquals(2, version);
-        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) 1);
-        Files.write(file, header);
+        assertEquals(1, version);
         try (Database db = Database.open(file, "dba", "dba")) {
             assertEquals(1, db.query("SELECT name FROM item").size());
         }
         assertEquals(1, ByteBuffer.wrap(Files.readAllBytes(file)).order(Format.ORDER).getShort(Format.VERSION_OFFSET) & 0xFFFF);
         header = Files.readAllBytes(file);
         long length = header.length;
+        ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) 2);
+        Files.write(file, header);
+        SeaException previous = assertThrows(SeaException.class, () -> Database.open(file, "dba", "dba"));
+        assertTrue(previous.getMessage().contains("unsupported database version"));
+        assertEquals(length, Files.size(file));
         ByteBuffer.wrap(header).order(Format.ORDER).putShort(Format.VERSION_OFFSET, (short) 99);
         Files.write(file, header);
         SeaException rejected = assertThrows(SeaException.class, () -> Database.open(file, "dba", "dba"));

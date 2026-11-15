@@ -15,12 +15,12 @@ final class Format {
     static final byte[] MAGIC = "SEADB-TBL".getBytes(StandardCharsets.US_ASCII);
     static final byte[] DB_MAGIC = "SEADB-DBF".getBytes(StandardCharsets.US_ASCII);
     static final byte[] LOG_MAGIC = "SEADB-LOG".getBytes(StandardCharsets.US_ASCII);
-    static final int VERSION = 2;
-    static final int DB_VERSION = 2;
+    static final int VERSION = 1;
+    static final int DB_VERSION = 1;
     static final int LOG_VERSION = 1;
-    /** Table metadata that stores a partial index, an expression key, or INCLUDE. */
-    static final int META_VERSION = 3;
-    /** A file from the previous layout still opens. A newer one does not. */
+    /** Same layout as {@link #VERSION}: collation, checks, and extended indexes are always stored. */
+    static final int META_VERSION = 1;
+    /** Only this layout opens. */
     static final int MIN_VERSION = 1;
 
     static boolean known(int version) {

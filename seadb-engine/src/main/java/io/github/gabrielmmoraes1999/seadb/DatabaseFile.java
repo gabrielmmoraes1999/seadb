@@ -974,9 +974,6 @@ final class DatabaseFile implements AutoCloseable {
     }
 
     int metaVersion(Schema schema) {
-        if (schema != null && schema.needsV2()) {
-            formatVersion = Format.DB_VERSION;
-        }
         return formatVersion;
     }
 

@@ -1617,7 +1617,7 @@ class DatabaseTest {
         assertEquals(0, Files.size(arquivo) % 16384);
         byte[] header = Files.readAllBytes(arquivo);
         ByteBuffer buffer = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
-        assertEquals(2, buffer.getShort(Format.VERSION_OFFSET) & 0xFFFF);
+        assertEquals(1, buffer.getShort(Format.VERSION_OFFSET) & 0xFFFF);
         assertEquals(16384, buffer.getInt(64));
         assertThrows(SeaException.class, () -> Database.open(arquivo, "dba", "dba"));
         try (Database db = Database.open(arquivo, "DBA", "segredo")) {
@@ -1630,7 +1630,7 @@ class DatabaseTest {
             assertEquals("Loja central", banco.getString("SEA$DESCRIPTION"));
             assertEquals("DBA", banco.getString("SEA$OWNER_NAME"));
             assertEquals(16384, banco.getInt("SEA$PAGE_SIZE"));
-            assertEquals(2, banco.getInt("SEA$FORMAT"));
+            assertEquals(1, banco.getInt("SEA$FORMAT"));
             assertEquals("WIN1252", db.query(
                     "SELECT SEA$VALUE FROM SEA$CONFIG WHERE SEA$KEY = 'Default.CharacterSet'").rows().get(0).getString(0));
             db.execute("CREATE TABLE item (id INTEGER PRIMARY KEY, nome VARCHAR(40))");
@@ -2053,7 +2053,7 @@ class DatabaseTest {
         Database.applyLog(arquivo(), dir.resolve("banco.log"));
         try (Database deNovo = open()) {
             assertEquals("Ana", deNovo.query("SELECT nome FROM t WHERE id = 1").rows().get(0).getString("nome"));
-            assertEquals(2, deNovo.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
+            assertEquals(1, deNovo.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
         }
         assertTrue(Files.size(dir.resolve("banco.log")) > Format.LOG_HEADER_SIZE);
     }
@@ -2138,7 +2138,7 @@ class DatabaseTest {
         try (Database db = Database.open(destino.resolve("loja.db"), "dba", "dba")) {
             assertEquals("depois", db.query("SELECT nome FROM t WHERE id = 2").rows().get(0).getString("nome"));
             assertEquals("antes", db.query("SELECT nome FROM t WHERE id = 1").rows().get(0).getString("nome"));
-            assertEquals(2, db.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
+            assertEquals(1, db.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
         }
 
         Database.create(dir.resolve("outro.db"), DatabaseOptions.defaults());
@@ -2184,7 +2184,7 @@ class DatabaseTest {
         Database.applyLog(completo.resolve("loja.db"), dir.resolve("loja.log"));
         try (Database db = Database.open(completo.resolve("loja.db"), "dba", "dba")) {
             assertEquals("mais", db.query("SELECT nome FROM t WHERE id = 3").rows().get(0).getString("nome"));
-            assertEquals(2, db.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
+            assertEquals(1, db.query("SELECT SEA$FORMAT FROM SEA$DATABASE").rows().get(0).getInt("SEA$FORMAT"));
         }
     }
 
