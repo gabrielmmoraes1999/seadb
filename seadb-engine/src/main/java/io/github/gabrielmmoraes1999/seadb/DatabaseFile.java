@@ -748,10 +748,12 @@ final class DatabaseFile implements AutoCloseable {
                 throw new SeaException("transaction log does not cover the checkpoint");
             }
             if (recoveryMessages != null) {
-                recoveryMessages.accept("Recovering from checkpoint at log offset " + checkpointLsn);
+                recoveryMessages.accept("Database recovery in progress");
+                recoveryMessages.accept("    Last checkpoint at log offset " + checkpointLsn);
+                Path logFile = log.path.getFileName();
+                recoveryMessages.accept("    Transaction log: " + (logFile == null ? log.path : logFile) + "...");
             }
-            log.replay(checkpointLsn, this::applyRedo, recoveryMessages == null ? null :
-                    offset -> recoveryMessages.accept("Checkpoint read at log offset " + offset));
+            log.replay(checkpointLsn, this::applyRedo, null);
             log.truncate(log.consistentEnd());
             if (checkpointLsn > log.size()) {
                 throw new SeaException("transaction log does not cover the checkpoint");
@@ -1204,7 +1206,17 @@ final class DatabaseFile implements AutoCloseable {
         boolean synchronizedCheckpoint = log.cleanCheckpoint(checkpointLsn);
         applying = false;
         if (!synchronizedCheckpoint) {
+            String when = Database.recoveryWhen();
+            String name = Database.databaseName(path);
+            Path fileName = path.getFileName();
+            String file = fileName == null ? name : fileName.toString();
+            if (recoveryMessages != null) {
+                recoveryMessages.accept("Starting checkpoint of \"" + name + "\" (" + file + ") at " + when);
+            }
             checkpoint(true);
+            if (recoveryMessages != null) {
+                recoveryMessages.accept("Finished checkpoint of \"" + name + "\" (" + file + ") at " + when);
+            }
         }
     }
 

@@ -257,7 +257,7 @@ class SqlExtensionTest {
         Path copy = temp.resolve("copy.db");
         Database.create(copy, DatabaseOptions.defaults());
         try (Database db = Database.open(copy, "dba", "dba")) {
-            db.execute(text);
+            db.execute(text.replaceAll("(?m)^go\\s*$", ";"));
             assertEquals("Ana", db.query("SELECT nome FROM item").rows().get(0).getString("nome"));
         }
     }

@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -46,8 +47,10 @@ class DbtranServiceTest {
         assertTrue(escrito.startsWith("sql written to:"));
         String texto = Files.readString(sql);
         assertTrue(texto.contains("CREATE TABLE t"));
-        assertTrue(texto.contains("INSERT INTO t VALUES (1, 'antes');"));
-        assertTrue(texto.contains("INSERT INTO t VALUES (2, 'd''agua');"));
+        assertTrue(texto.contains("INSERT INTO t VALUES (1, 'antes')"));
+        assertTrue(texto.contains("INSERT INTO t VALUES (2, 'd''agua')"));
+        assertTrue(texto.contains("\ngo\n"));
+        assertFalse(texto.contains("SELECT"));
         Path peloBanco = dir.resolve("pelo-db.sql");
         DbtranService.export(arquivo.toString(), peloBanco, null);
         assertEquals(texto, Files.readString(peloBanco));
@@ -89,7 +92,8 @@ class DbtranServiceTest {
         assertTrue(saida.contains("exporting: 100%"));
         assertTrue(saida.contains("sql written to:"));
         String texto = Files.readString(sql);
-        assertTrue(texto.contains("INSERT INTO t VALUES (1, 'd''agua');"));
+        assertTrue(texto.contains("INSERT INTO t VALUES (1, 'd''agua')"));
+        assertTrue(texto.contains("\ngo\n"));
         Path peloBanco = dir.resolve("pelo-db.sql");
         Dbtran.execute(new String[]{arquivo.toString(), peloBanco.toString()});
         assertEquals(texto, Files.readString(peloBanco));

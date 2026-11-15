@@ -7,9 +7,14 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.function.IntConsumer;
@@ -155,22 +160,38 @@ public final class Database implements AutoCloseable {
         }
         ReplayCut.arm(until);
         try {
-            long checkpoint;
-            try (Engine engine = Engine.openApplying(database, cache, messages)) {
-                if (messages != null) messages.accept("Applying committed transactions from " + log);
-                engine.applyExternalLog(log, applied);
-                checkpoint = engine.checkpointLsn();
+            if (messages != null) {
+                messages.accept("Starting database \"" + databaseName(database) + "\" ("
+                        + database.toAbsolutePath().normalize() + ") at " + recoveryWhen());
             }
-            if (messages != null) messages.accept("Checkpoint applied at log offset " + checkpoint);
+            try (Engine engine = Engine.openApplying(database, cache, messages)) {
+                engine.applyExternalLog(log, applied);
+            }
+            if (messages != null) {
+                messages.accept("Recovery complete");
+            }
         } finally {
             ReplayCut.clear();
         }
+    }
+
+    /** Clock shown while a log is applied. The minute is enough, as on the server console. */
+    static String recoveryWhen() {
+        return DateTimeFormatter.ofPattern("EEE MMM dd yyyy HH:mm", Locale.ENGLISH).format(LocalDateTime.now());
+    }
+
+    static String databaseName(Path file) {
+        Path name = file == null ? null : file.getFileName();
+        String text = name == null ? "database" : name.toString();
+        int dot = text.lastIndexOf('.');
+        return dot > 0 ? text.substring(0, dot) : text;
     }
 
     /**
      * Reads the compressed transactions from the {@code .log} and writes the SQL to {@code destination}.
      * {@code source} may be the {@code .log} or the {@code .db} beside it.
      * Parameters are written into the text in place of each {@code ?}.
+     * A query is omitted. The script uses {@code BEGIN TRANSACTION}, {@code COMMIT WORK}, and {@code go}.
      */
     public static void exportSql(Path source, Path destination) {
         exportSql(source, destination, null);
@@ -218,12 +239,12 @@ public final class Database implements AutoCloseable {
                 transactionLog.forEachTransaction(Format.LOG_HEADER_SIZE, at ->
                         mark.accept((int) Math.min(99L, at * 99L / total)), (batch, start) -> {
                     int count = batch.statements.size();
-                    script.write(batch, index -> {
+                    script.write(batch, start, index -> {
                         long span = batch.end - start;
                         long pos = count == 0 ? batch.end : start + span * index / count;
                         mark.accept((int) Math.min(99L, pos * 99L / total));
                     });
-                });
+                }, script::checkpoint);
                 script.finish();
             }
             report(progress, 100);
@@ -251,38 +272,72 @@ public final class Database implements AutoCloseable {
         throw new SeaException("provide a .log file or the .db beside it");
     }
 
-    /** Writes the SQL of each commit as it is read, instead of holding the whole script. */
+    /** Writes the SQL of each commit as it is read, in the shape of a SQL Anywhere script. */
     private static final class SqlScript {
         private final Writer out;
-        private String schema;
+        private String connectKey;
         private boolean started;
 
         private SqlScript(Writer out) {
             this.out = out;
         }
 
-        private void write(TransactionLog.Batch batch, IntConsumer written) throws IOException {
-            if (started) {
-                out.write('\n');
-            }
+        private void checkpoint(long offset) throws IOException {
+            line("--CHECKPOINT-0000-" + offset(offset));
+        }
+
+        private void write(TransactionLog.Batch batch, long start, IntConsumer written) throws IOException {
+            List<TransactionLog.Applied> kept = new ArrayList<>();
             int index = 0;
             for (TransactionLog.Applied statement : batch.statements) {
                 index++;
-                if (statement.sql != null && !statement.sql.isBlank()) {
-                    if (schema == null || !schema.equalsIgnoreCase(statement.schema)) {
-                        schema = statement.schema;
-                        out.write("SET SCHEMA ");
-                        out.write(schemaName(schema));
-                        out.write(";\n");
-                    }
-                    out.write(bind(statement.sql, statement.params));
-                    out.write('\n');
-                    started = true;
+                TransactionLog.Applied logged = logged(statement);
+                if (logged != null) {
+                    kept.add(logged);
                 }
                 if (written != null) {
                     written.accept(index);
                 }
             }
+            if (kept.isEmpty()) {
+                return;
+            }
+            TransactionLog.Applied first = kept.get(0);
+            String conn = connection(first.connection);
+            if (first.user != null) {
+                String key = conn + "\0" + first.user;
+                if (!key.equals(connectKey)) {
+                    connectKey = key;
+                    StringBuilder connect = new StringBuilder("--CONNECT-").append(conn).append('-')
+                            .append(offset(start)).append('-').append(first.user);
+                    if (batch.commitMillis != null) {
+                        connect.append('-').append(minute(batch.commitMillis));
+                    }
+                    line(connect.toString());
+                }
+            }
+            line("--BEGIN TRANSACTION-" + conn + "-" + offset(start));
+            line("BEGIN TRANSACTION");
+            line("go");
+            for (TransactionLog.Applied statement : kept) {
+                line("--" + operation(statement.sql) + "-" + conn + "-" + offset(start));
+                line(bind(statement.sql, statement.params));
+                line("go");
+            }
+            long commitAt = batch.commitAt > 0 ? batch.commitAt : batch.end;
+            StringBuilder commit = new StringBuilder("--COMMIT-").append(conn).append('-').append(offset(commitAt));
+            if (batch.commitMillis != null) {
+                commit.append('-').append(stamp(batch.commitMillis));
+            }
+            line(commit.toString());
+            line("COMMIT WORK");
+            line("go");
+        }
+
+        private void line(String text) throws IOException {
+            out.write(text);
+            out.write('\n');
+            started = true;
         }
 
         private void finish() throws IOException {
@@ -291,6 +346,86 @@ public final class Database implements AutoCloseable {
             }
         }
     }
+
+    private static TransactionLog.Applied logged(TransactionLog.Applied statement) {
+        if (statement == null || statement.sql == null || statement.sql.isBlank() || control(statement.sql)) {
+            return null;
+        }
+        SqlParser.DurableSql durable = SqlParser.durable(statement.sql);
+        if (durable == null) {
+            return null;
+        }
+        Object[] params = statement.params == null ? new Object[0] : statement.params;
+        if (params.length > durable.parameters()) {
+            params = Arrays.copyOf(params, durable.parameters());
+        }
+        return new TransactionLog.Applied(statement.schema, durable.sql(), params, statement.connection, statement.user);
+    }
+
+    private static boolean control(String sql) {
+        String word = operation(sql);
+        return word.equals("BEGIN") || word.equals("COMMIT") || word.equals("ROLLBACK") || word.equals("START");
+    }
+
+    private static String operation(String sql) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (Character.isWhitespace(current)) {
+                index++;
+                continue;
+            }
+            if (current == '-' && index + 1 < sql.length() && sql.charAt(index + 1) == '-') {
+                int end = sql.indexOf('\n', index);
+                index = end < 0 ? sql.length() : end + 1;
+                continue;
+            }
+            if (current == '/' && index + 1 < sql.length() && sql.charAt(index + 1) == '*') {
+                int end = sql.indexOf("*/", index + 2);
+                index = end < 0 ? sql.length() : end + 2;
+                continue;
+            }
+            break;
+        }
+        int start = index;
+        while (index < sql.length() && Character.isLetter(sql.charAt(index))) {
+            index++;
+        }
+        if (start == index) {
+            return "SQL";
+        }
+        return sql.substring(start, index).toUpperCase(Locale.ROOT);
+    }
+
+    private static String offset(long value) {
+        if (value < 0) {
+            value = 0;
+        }
+        return String.format("%011d", value);
+    }
+
+    private static String connection(long id) {
+        if (id < 0) {
+            id = 0;
+        }
+        if (id <= 9999) {
+            return String.format("%04d", id);
+        }
+        return Long.toString(id);
+    }
+
+    private static String stamp(long millis) {
+        LocalDateTime time = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault());
+        return COMMIT_STAMP.format(time) + "000";
+    }
+
+    private static String minute(long millis) {
+        LocalDateTime time = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault());
+        return CONNECT_STAMP.format(time);
+    }
+
+    private static final DateTimeFormatter COMMIT_STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final DateTimeFormatter CONNECT_STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
     private static String bind(String sql, Object[] params) {
         StringBuilder out = new StringBuilder();
@@ -320,17 +455,10 @@ public final class Database implements AutoCloseable {
             out.append(current);
         }
         String text = out.toString().strip();
-        if (text.endsWith(";")) {
-            return text;
+        while (text.endsWith(";")) {
+            text = text.substring(0, text.length() - 1).stripTrailing();
         }
-        return text + ";";
-    }
-
-    private static String schemaName(String schema) {
-        if (schema != null && schema.matches("[A-Za-z_][A-Za-z0-9_]*")) {
-            return schema;
-        }
-        return "\"" + (schema == null ? "public" : schema.replace("\"", "\"\"")) + "\"";
+        return text;
     }
 
     private static String literal(Object value) {

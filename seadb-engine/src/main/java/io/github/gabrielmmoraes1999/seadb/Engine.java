@@ -143,9 +143,7 @@ final class Engine implements AutoCloseable {
         try {
             engine.loadTables();
             if (!session) {
-                if (messages != null) messages.accept("Undoing uncommitted transactions");
                 engine.recoverUncommitted();
-                if (messages != null) messages.accept("Recovering committed transactions");
                 engine.recoverCommittedSql();
             }
             engine.ensureSystem(DatabaseOptions.defaults());
@@ -194,8 +192,12 @@ final class Engine implements AutoCloseable {
             int shown = 0;
             for (TransactionLog.Batch batch : plan.batches) {
                 for (TransactionLog.Applied statement : batch.statements) {
+                    SqlParser.DurableSql durable = loggedSql(statement);
+                    if (durable == null) {
+                        continue;
+                    }
                     replay.schema(statement.schema);
-                    execute(replay, statement.sql, statement.params);
+                    execute(replay, durable.sql(), paramsFor(statement.params, durable.parameters()));
                 }
                 storage.noteApplied(batch.end);
                 done++;
@@ -354,8 +356,12 @@ final class Engine implements AutoCloseable {
         int mark = pending.size();
         try {
             if (!suppressCapture && captureDepth == 0) {
-                Object[] copy = copyParams(parameters);
-                pending.add(new TransactionLog.Applied(activeSchema(), sql, copy));
+                SqlParser.DurableSql durable = SqlParser.durable(sql);
+                if (durable != null && !transactionControl(durable.sql())) {
+                    pending.add(new TransactionLog.Applied(activeSchema(), durable.sql(),
+                            paramsFor(copyParams(parameters), durable.parameters()),
+                            connectionId(session), connectionUser(session)));
+                }
             }
             captureDepth++;
             boolean userStatement = !suppressCapture && captureDepth == 1;
@@ -10606,12 +10612,13 @@ final class Engine implements AutoCloseable {
             execute(replay, "BEGIN", new Object[0]);
             for (TransactionLog.Batch batch : batches) {
                 for (TransactionLog.Applied statement : batch.statements) {
-                    if (transactionControl(statement.sql)) {
+                    SqlParser.DurableSql durable = loggedSql(statement);
+                    if (durable == null) {
                         continue;
                     }
                     replay.schema(statement.schema);
                     try {
-                        execute(replay, statement.sql, statement.params);
+                        execute(replay, durable.sql(), paramsFor(statement.params, durable.parameters()));
                     } catch (SeaException exception) {
                         // A commit that did not close still checkpointed the CREATE.
                         // The statement text sits after that checkpoint and would
@@ -10681,6 +10688,35 @@ final class Engine implements AutoCloseable {
             }
         }
         return false;
+    }
+
+    /** A statement already stored in an older log. A query is not replayed. */
+    private static SqlParser.DurableSql loggedSql(TransactionLog.Applied statement) {
+        if (statement == null || transactionControl(statement.sql)) {
+            return null;
+        }
+        return SqlParser.durable(statement.sql);
+    }
+
+    private static Object[] paramsFor(Object[] params, int expected) {
+        if (params == null) {
+            return expected == 0 ? new Object[0] : null;
+        }
+        if (params.length > expected) {
+            return Arrays.copyOf(params, expected);
+        }
+        return params;
+    }
+
+    private static long connectionId(Session session) {
+        return session == null ? 0L : session.attachmentId;
+    }
+
+    private static String connectionUser(Session session) {
+        if (session == null || session.user == null || session.user.isBlank()) {
+            return null;
+        }
+        return session.user;
     }
 
     private static boolean transactionControl(String sql) {

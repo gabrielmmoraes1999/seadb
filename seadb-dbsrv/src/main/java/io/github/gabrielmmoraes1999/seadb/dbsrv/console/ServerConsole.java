@@ -92,6 +92,7 @@ public final class ServerConsole extends JFrame {
     private static final Color STOPPED_WASH = new Color(0xF2F4F7);
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("MM/dd HH:mm:ss");
     private static final DateTimeFormatter WHEN = DateTimeFormatter.ofPattern("EEE MMM dd yyyy HH:mm:ss", Locale.ENGLISH);
+    private static final DateTimeFormatter STOPPED_AT = DateTimeFormatter.ofPattern("EEE MMM dd yyyy HH:mm", Locale.ENGLISH);
     private static final int LOG_LIMIT = 350_000;
 
     private final Arguments arguments;
@@ -296,25 +297,16 @@ public final class ServerConsole extends JFrame {
     private void applyAndFinish() {
         Path file = arguments.databases().get(0).path();
         Path transactionLog = arguments.applyLog();
-        show("Applying transaction log " + transactionLog);
-        show("Database: " + file.toAbsolutePath());
-        int[] shown = {0};
-        show("0% complete");
         try {
-            Database.applyLog(file, transactionLog, Cache.of(arguments.cacheBytes()), percent -> {
-                shown[0] = percent;
-                show(percent + "% complete");
-            }, this::show);
+            Database.applyLog(file, transactionLog, Cache.of(arguments.cacheBytes()), null, this::show);
         } catch (RuntimeException exception) {
             error(message(exception));
             error("The log was not applied. Shutdown closes this window.");
             return;
         }
-        if (shown[0] < 100) {
-            show("100% complete");
-        }
-        show("Transaction log applied.");
-        info("Server shutting down");
+        show("Database server shutdown automatically after log applied");
+        show("Completing server shutdown");
+        show("Database server stopped at " + STOPPED_AT.format(LocalDateTime.now()));
         try {
             Thread.sleep(1200);
         } catch (InterruptedException exception) {

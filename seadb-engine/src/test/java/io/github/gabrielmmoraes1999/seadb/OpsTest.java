@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -59,6 +60,9 @@ class OpsTest {
         Database.exportSql(file, sql);
         String exported = Files.readString(sql);
         assertTrue(exported.contains("INSERT"));
+        assertTrue(exported.contains("BEGIN TRANSACTION"));
+        assertTrue(exported.contains("COMMIT WORK"));
+        assertTrue(exported.contains("\ngo\n"));
         Path full = temp.resolve("full.db");
         Files.copy(snap, full);
         Files.copy(TransactionLog.beside(snap), TransactionLog.beside(full));
@@ -73,5 +77,33 @@ class OpsTest {
         try (Database db = Database.open(cutFile, "dba", "dba")) {
             assertEquals(1, db.query("SELECT id FROM t").size());
         }
+    }
+
+    @Test
+    void exportSkipsSelectAndUsesTheSybaseScript() throws Exception {
+        Path file = temp.resolve("script.db");
+        Database.create(file, DatabaseOptions.defaults());
+        try (Database db = Database.open(file, "dba", "dba")) {
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, nome VARCHAR(20))");
+            db.execute("BEGIN");
+            db.execute("INSERT INTO t VALUES (1, 'a')");
+            db.execute("SELECT id FROM t");
+            db.execute("EXPLAIN SELECT id FROM t");
+            db.execute("COMMIT");
+        }
+        Path sql = temp.resolve("script.sql");
+        Database.exportSql(file, sql);
+        String exported = Files.readString(sql);
+        String upper = exported.toUpperCase();
+        assertFalse(upper.contains("SELECT"));
+        assertFalse(upper.contains("EXPLAIN"));
+        assertTrue(exported.contains("--INSERT-"));
+        assertTrue(exported.contains("--CONNECT-"));
+        assertTrue(exported.contains("-DBA-"));
+        assertTrue(exported.contains("--CHECKPOINT-0000-"));
+        assertTrue(exported.contains("BEGIN TRANSACTION"));
+        assertTrue(exported.contains("\ngo\n"));
+        assertTrue(exported.contains("COMMIT WORK"));
+        assertTrue(exported.contains("'a'"));
     }
 }

@@ -28,6 +28,80 @@ final class SqlParser {
         return new ParsedSql(parser.script(), parser.parameters);
     }
 
+    /**
+     * The part of a script that changes data. A query and {@code EXPLAIN} are left out.
+     * Null when nothing remains.
+     */
+    static DurableSql durable(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return null;
+        }
+        SqlParser parser = new SqlParser(sql);
+        parser.lex();
+        List<Integer> starts = new ArrayList<>();
+        List<Boolean> queries = new ArrayList<>();
+        parser.skipSemicolons();
+        if (parser.peek(TokenKind.EOF)) {
+            return null;
+        }
+        while (!parser.peek(TokenKind.EOF)) {
+            starts.add(parser.current().start);
+            Stmt statement = parser.statement();
+            queries.add(statement instanceof Query || statement instanceof Explain);
+            if (parser.consumeSymbol(";")) {
+                parser.skipSemicolons();
+                continue;
+            }
+            if (!parser.peek(TokenKind.EOF)) {
+                throw parser.error("missing ';' between statements");
+            }
+        }
+        boolean kept = false;
+        boolean dropped = false;
+        for (boolean query : queries) {
+            if (query) {
+                dropped = true;
+            } else {
+                kept = true;
+            }
+        }
+        if (!kept) {
+            return null;
+        }
+        if (!dropped) {
+            return new DurableSql(sql, parser.parameters);
+        }
+        StringBuilder text = new StringBuilder();
+        int parameters = 0;
+        for (int i = 0; i < queries.size(); i++) {
+            if (queries.get(i)) {
+                continue;
+            }
+            int from = starts.get(i);
+            int to = i + 1 < starts.size() ? starts.get(i + 1) : sql.length();
+            String piece = sql.substring(from, to).strip();
+            while (piece.endsWith(";")) {
+                piece = piece.substring(0, piece.length() - 1).stripTrailing();
+            }
+            if (piece.isEmpty()) {
+                continue;
+            }
+            if (!text.isEmpty()) {
+                text.append(";\n");
+            }
+            text.append(piece);
+            parameters += parser.paramsBetween(from, to);
+        }
+        if (text.isEmpty()) {
+            return null;
+        }
+        return new DurableSql(text.toString(), parameters);
+    }
+
+    /** SQL that changes data, and how many {@code ?} it still has. */
+    record DurableSql(String sql, int parameters) {
+    }
+
     static Expr parseExpression(String source) {
         if (source == null || source.isBlank()) {
             throw new SeaException("empty expression");
@@ -3112,6 +3186,16 @@ final class SqlParser {
             data[i] = (byte) ((high << 4) + low);
         }
         return data;
+    }
+
+    private int paramsBetween(int from, int to) {
+        int count = 0;
+        for (Token token : tokens) {
+            if (token.kind == TokenKind.PARAM && token.start >= from && token.start < to) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private Token symbol(String text, int start, int end) {

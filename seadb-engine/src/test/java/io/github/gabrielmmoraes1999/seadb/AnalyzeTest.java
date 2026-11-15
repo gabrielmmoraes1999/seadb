@@ -82,7 +82,7 @@ class AnalyzeTest {
         Path copy = temp.resolve("copy.db");
         Database.create(copy, DatabaseOptions.defaults());
         try (Database db = Database.open(copy, "dba", "dba")) {
-            db.execute(Files.readString(sql));
+            db.execute(Files.readString(sql).replaceAll("(?m)^go\\s*$", ";"));
             assertEquals(11L, db.query("""
                     SELECT SEA$CARDINALITY FROM SEA$STATISTICS
                     WHERE SEA$RELATION_NAME = 't' AND SEA$INDEX_NAME = ''

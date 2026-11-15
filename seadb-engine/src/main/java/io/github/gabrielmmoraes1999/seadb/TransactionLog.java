@@ -544,21 +544,18 @@ final class TransactionLog implements AutoCloseable {
     private void writeTxnSql(long txnId, List<Applied> statements) {
         ByteWriter payload = new ByteWriter();
         payload.u64(txnId);
-        payload.u32(statements.size());
-        for (Applied statement : statements) {
-            payload.utf(statement.schema);
-            payload.utf(statement.sql);
-            Object[] params = statement.params == null ? new Object[0] : statement.params;
-            payload.u32(params.length);
-            for (Object param : params) {
-                writeParam(payload, param);
-            }
-        }
+        writeStatements(payload, statements);
         append(Format.RECORD_TXN_SQL, payload.toArray());
     }
 
     private void writeTransaction(List<Applied> statements) {
         ByteWriter payload = new ByteWriter();
+        writeStatements(payload, statements);
+        append(Format.RECORD_TRANSACTION, payload.toArray());
+    }
+
+    /** Statements, then the connection and the user. An old log stops after the parameters. */
+    private static void writeStatements(ByteWriter payload, List<Applied> statements) {
         payload.u32(statements.size());
         for (Applied statement : statements) {
             payload.utf(statement.schema);
@@ -569,7 +566,10 @@ final class TransactionLog implements AutoCloseable {
                 writeParam(payload, param);
             }
         }
-        append(Format.RECORD_TRANSACTION, payload.toArray());
+        for (Applied statement : statements) {
+            payload.u64(statement.connection);
+            payload.utf(statement.user);
+        }
     }
 
     private static int statementCost(Applied statement) {
@@ -584,6 +584,7 @@ final class TransactionLog implements AutoCloseable {
                 cost += utfCost(text);
             }
         }
+        cost += 12 + utfCost(statement.user);
         return cost;
     }
 
@@ -619,6 +620,15 @@ final class TransactionLog implements AutoCloseable {
      * {@code consumer} receives the commit and the offset where its record starts.
      */
     void forEachTransaction(long from, LongConsumer seen, TransactionConsumer consumer) throws IOException {
+        forEachTransaction(from, seen, consumer, null);
+    }
+
+    /**
+     * Same commits as {@link #forEachTransaction(long, LongConsumer, TransactionConsumer)}.
+     * {@code checkpoints} receives each checkpoint offset, in log order.
+     */
+    void forEachTransaction(long from, LongConsumer seen, TransactionConsumer consumer,
+                            CheckpointConsumer checkpoints) throws IOException {
         long size = size();
         if (size < Format.LOG_HEADER_SIZE) {
             throw new SeaException("transaction log is corrupt");
@@ -627,6 +637,8 @@ final class TransactionLog implements AutoCloseable {
         List<Long> heldAt = new ArrayList<>();
         Map<Long, List<Long>> openSql = new LinkedHashMap<>();
         boolean skipSql = false;
+        long lastCommitAt = 0L;
+        Long lastCommitMillis = null;
         long at = Format.LOG_HEADER_SIZE;
         while (at + 4 <= size) {
             int recordLength = readInt(at);
@@ -652,7 +664,8 @@ final class TransactionLog implements AutoCloseable {
             }
             if (type == Format.RECORD_TRANSACTION && at >= from) {
                 if (!skipSql) {
-                    held.add(new Batch(at + recordLength, decodeTransaction(readable(record))));
+                    held.add(new Batch(at + recordLength, decodeTransaction(readable(record)),
+                            lastCommitAt, lastCommitMillis));
                     heldAt.add(at);
                 }
             } else if (type == Format.RECORD_TXN_SQL && at >= from) {
@@ -660,11 +673,17 @@ final class TransactionLog implements AutoCloseable {
                 openSql.computeIfAbsent(id, key -> new ArrayList<>()).add(at);
             } else if (type == Format.RECORD_COMMIT) {
                 byte[] plain = readable(record);
+                lastCommitAt = at;
+                lastCommitMillis = commitMillis(plain);
                 long id = readTxnId(plain);
                 List<Long> mine = openSql.remove(id);
                 skipSql = !keepCommit(plain);
                 if (!skipSql) {
-                    emitTxn(consumer, mine);
+                    emitTxn(consumer, mine, lastCommitAt, lastCommitMillis);
+                }
+            } else if (type == Format.RECORD_CHECKPOINT) {
+                if (checkpoints != null && at >= from) {
+                    checkpoints.accept(at);
                 }
             } else if (type == Format.RECORD_ROLLBACK) {
                 long id = readTxnId(readable(record));
@@ -699,14 +718,16 @@ final class TransactionLog implements AutoCloseable {
         heldAt.clear();
     }
 
-    private void emitTxn(TransactionConsumer consumer, List<Long> starts) throws IOException {
+    private void emitTxn(TransactionConsumer consumer, List<Long> starts, long commitAt,
+                         Long commitMillis) throws IOException {
         if (consumer == null || starts == null) {
             return;
         }
         for (long start : starts) {
             int recordLength = readInt(start);
             byte[] record = Format.readFully(channel, start, recordLength);
-            consumer.accept(new Batch(start + recordLength, decodeTxnSql(readable(record))), start);
+            consumer.accept(new Batch(start + recordLength, decodeTxnSql(readable(record)), commitAt, commitMillis),
+                    start);
         }
     }
 
@@ -1463,6 +1484,15 @@ final class TransactionLog implements AutoCloseable {
         return id;
     }
 
+    private static Long commitMillis(byte[] record) {
+        ByteBuffer buffer = payload(record);
+        readLong(buffer);
+        if (buffer.remaining() != 8) {
+            return null;
+        }
+        return readLong(buffer);
+    }
+
     private static boolean keepCommit(byte[] record) {
         java.time.Instant cut = ReplayCut.until();
         if (cut == null) {
@@ -1536,16 +1566,26 @@ final class TransactionLog implements AutoCloseable {
         return rows;
     }
 
-    /** A committed SQL statement, with the session schema and the parameters. */
+    /** A committed SQL statement, with the session schema, the parameters, and the connection. */
     static final class Applied {
         final String schema;
         final String sql;
         final Object[] params;
+        /** Zero when the log was written before connections were stored. */
+        final long connection;
+        /** Null when the log has no user for this statement. */
+        final String user;
 
         Applied(String schema, String sql, Object[] params) {
+            this(schema, sql, params, 0L, null);
+        }
+
+        Applied(String schema, String sql, Object[] params, long connection, String user) {
             this.schema = schema == null || schema.isBlank() ? "public" : schema;
             this.sql = sql;
             this.params = params == null ? new Object[0] : params;
+            this.connection = connection < 0 ? 0L : connection;
+            this.user = user == null || user.isBlank() ? null : user;
         }
     }
 
@@ -1555,14 +1595,30 @@ final class TransactionLog implements AutoCloseable {
         void accept(Batch batch, long start) throws IOException;
     }
 
-    /** A log commit: the statements and the offset where the record ends. */
+    /** Receives a checkpoint offset while the log is still being read. */
+    @FunctionalInterface
+    interface CheckpointConsumer {
+        void accept(long offset) throws IOException;
+    }
+
+    /** A log commit: the statements, the offset where the record ends, and the commit time. */
     static final class Batch {
         final long end;
         final List<Applied> statements;
+        /** Offset of the commit record. Zero when this batch has no commit beside it. */
+        final long commitAt;
+        /** Null when the commit record has no time. */
+        final Long commitMillis;
 
         Batch(long end, List<Applied> statements) {
+            this(end, statements, 0L, null);
+        }
+
+        Batch(long end, List<Applied> statements, long commitAt, Long commitMillis) {
             this.end = end;
             this.statements = statements;
+            this.commitAt = commitAt;
+            this.commitMillis = commitMillis;
         }
     }
 
@@ -1684,7 +1740,20 @@ final class TransactionLog implements AutoCloseable {
             }
             statements.add(new Applied(schema, sql, values));
         }
-        return statements;
+        if (buffer.remaining() == 0) {
+            return statements;
+        }
+        List<Applied> withSession = new ArrayList<>(statements.size());
+        for (Applied statement : statements) {
+            long connection = readLong(buffer);
+            String user = readUtf(buffer);
+            withSession.add(new Applied(statement.schema, statement.sql, statement.params, connection,
+                    user.isEmpty() ? null : user));
+        }
+        if (buffer.remaining() != 0) {
+            throw new SeaException("transaction log is corrupt");
+        }
+        return withSession;
     }
 
     private static Object readParam(ByteBuffer buffer) {
