@@ -5739,12 +5739,17 @@ final class Engine implements AutoCloseable {
     }
 
     private boolean shouldShrink(TableStore table) {
+        long wanted = DatabaseFile.capacityFor(table.packedBytes(), storage.pageSize());
+        // An undone checkpoint can publish a region the remaining rows do not fill.
+        // The logical size still matches the old header, so the free-list check would keep it.
+        if (table.releaseSpareCapacity()) {
+            return wanted < table.capacity() && wanted * 2 < table.capacity();
+        }
         // A rewrite is smaller than half the file only when free space is most of it.
         // That check uses the free list, so a checkpoint does not copy every row.
         if (table.occupiedBytes() * 2 >= table.logicalSize()) {
             return false;
         }
-        long wanted = DatabaseFile.capacityFor(table.packedBytes(), storage.pageSize());
         // An exact half remains: the next insert fills that page and packing would return the same split.
         return wanted < table.capacity() && wanted * 2 < table.capacity();
     }
@@ -10964,6 +10969,7 @@ final class Engine implements AutoCloseable {
             for (TransactionLog.RowImage row : tableUndo.deleted) {
                 table.restoreRow(row.id, row.values);
             }
+            table.packSpareCapacity();
         }
         for (String[] created : undo.created) {
             String key = Relation.key(created[0], created[1]);

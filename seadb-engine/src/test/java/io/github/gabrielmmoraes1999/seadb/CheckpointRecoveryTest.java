@@ -5,6 +5,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -20,6 +21,51 @@ class CheckpointRecoveryTest {
 
     @TempDir
     Path dir;
+
+    @Test
+    void aplicarLogNaoGuardaOTamanhoDaTransacaoAberta() throws Exception {
+        Path file = database();
+        try (Database db = open(file)) {
+            db.execute("CREATE TABLE item (id INTEGER PRIMARY KEY, nome VARCHAR(2000))");
+            db.execute("INSERT INTO item VALUES (1, 'fixo')");
+        }
+        long committedSize = Files.size(file);
+        Path base = dir.resolve("base.db");
+        Files.copy(file, base);
+        String lote = "x".repeat(2000);
+        Database db = open(file);
+        try {
+            db.checkpointPolicy(new CheckpointPolicy(20, Integer.MAX_VALUE, Long.MAX_VALUE, 1024, 2));
+            db.execute("BEGIN");
+            for (int i = 0; i < 800; i++) {
+                db.execute("INSERT INTO item VALUES (?, ?)", i + 2, lote);
+            }
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            long grown = Files.size(file);
+            while (grown <= committedSize * 2 && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+                grown = Files.size(file);
+            }
+            assertTrue(db.transactionActive());
+            assertTrue(grown > committedSize * 2, "checkpoint did not grow the file: " + grown);
+            db.checkpointPolicy(CheckpointPolicy.MANUAL);
+            db.login("dba", "dba");
+            db.checkpoint();
+            db.crash();
+        } finally {
+            db.close();
+        }
+        long grown = Files.size(file);
+        Files.copy(base, file, StandardCopyOption.REPLACE_EXISTING);
+        Database.applyLog(file, logOf(file));
+        long applied = Files.size(file);
+        assertTrue(applied < grown / 2,
+                "uncommitted size remained: committed " + committedSize + ", grown " + grown + ", applied " + applied);
+        try (Database again = open(file)) {
+            assertEquals(1L, count(again, "item"));
+            assertEquals("fixo", again.query("SELECT nome FROM item WHERE id = 1").rows().get(0).getString("nome"));
+        }
+    }
 
     @Test
     void muitosInsertsSemCommitSaoDesfeitos() {

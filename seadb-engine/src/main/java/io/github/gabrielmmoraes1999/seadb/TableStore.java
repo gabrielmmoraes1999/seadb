@@ -40,6 +40,8 @@ final class TableStore implements AutoCloseable {
     private long generation;
     private int activeSlot;
     private boolean dirty;
+    /** Undo left a region much larger than the rows that remain. The next flush packs it. */
+    private boolean spareCapacity;
     /**
      * The live map is what a committed savepoint still sees.
      * The next change copies the map before modifying it.
@@ -126,6 +128,18 @@ final class TableStore implements AutoCloseable {
 
     boolean isDirty() {
         return dirty;
+    }
+
+    /** The open transaction's checkpoint published this region. Recovery packs what commit kept. */
+    void packSpareCapacity() {
+        spareCapacity = true;
+        dirty = true;
+    }
+
+    boolean releaseSpareCapacity() {
+        boolean value = spareCapacity;
+        spareCapacity = false;
+        return value;
     }
 
     List<StoredRow> scan() {
